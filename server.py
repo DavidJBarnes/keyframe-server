@@ -6,8 +6,8 @@ Mirrors the fal request/response shape so generate.py can target it with
 Output: {images: [{url: data URI, content_type, file_name}]}.
 
 Quantization modes (pick per VRAM budget on a 24GB 3090):
-  --quant nunchaku : INT4 SVDQuant transformer (fastest load, most headroom;
-                     leaves room to keep LTX partially resident)
+  --quant nunchaku : INT4 SVDQuant transformer (fastest, fits fully in 24GB so
+                     no CPU offload thrash; needs Python <3.13 for the wheel)
   --quant fp8      : torchao float8 weight-only on the bf16 transformer
   --quant none     : bf16 + model CPU offload (slowest, max quality)
 
@@ -15,7 +15,9 @@ Lightning LoRA (4-step) is loaded by default; disable with --no-lightning
 for full 40-step quality on hard edits.
 
 Run:
-  python qwen_edit_server.py --host 0.0.0.0 --port 8188 --quant nunchaku
+  python server.py --host 0.0.0.0 --port 8188 --quant nunchaku
+
+Note: on 3090.zero, port 8188 is ComfyUI — use --port 8189 there.
 """
 import argparse
 import base64
@@ -30,12 +32,23 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
-# Check huggingface.co/nunchaku-tech for the exact 2511 repo/file name for your
-# GPU generation (INT4 for pre-Blackwell like the 3090, FP4 for RTX 50-series).
-NUNCHAKU_REPO = "nunchaku-tech/nunchaku-qwen-image-edit-2511"
+
+# nunchaku-tech/* does not exist and nunchaku-ai (the real org) has no 2511 build,
+# so the INT4 transformer comes from a community quantisation. Filenames there are
+# nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors — NOT the
+# svdq-{precision}_r128-* scheme the official repos use.
+#   precision: int4 for pre-Blackwell (3090 = sm_86), fp4 for RTX 50-series
+#   variant:   ultimate_speed (11.5GB) | balance (12.7GB) | best_quality (14.2GB)
+NUNCHAKU_REPO = "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511"
+NUNCHAKU_VARIANT = "balance"
+
+# No 2511 Lightning LoRA has been published — lightx2v/Qwen-Image-Lightning stops
+# at 2509. The 2509 4-step LoRA is architecturally compatible in principle but is
+# NOT officially supported on 2511; load_pipeline falls back to full sampling if
+# it refuses to load.
 LIGHTNING_LORA = (
     "lightx2v/Qwen-Image-Lightning",
-    "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+    "Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
 )
 
 app = FastAPI(title="qwen-edit-local")
@@ -113,9 +126,12 @@ def load_pipeline(quant: str, lightning: bool):
         from nunchaku import NunchakuQwenImageTransformer2DModel
         from nunchaku.utils import get_precision
 
-        transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
-            f"{NUNCHAKU_REPO}/svdq-{get_precision()}_r128-qwen-image-edit-2511.safetensors"
+        weights = (
+            f"{NUNCHAKU_REPO}/"
+            f"nunchaku_qwen_image_edit_2511_{NUNCHAKU_VARIANT}_{get_precision()}.safetensors"
         )
+        print(f"[nunchaku] loading {weights}")
+        transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(weights)
         pipe = QwenImageEditPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
         )
@@ -138,8 +154,17 @@ def load_pipeline(quant: str, lightning: bool):
 
     if lightning:
         repo, weight = LIGHTNING_LORA
-        pipe.load_lora_weights(repo, weight_name=weight)
-        STEPS, CFG = 4, 1.0
+        try:
+            pipe.load_lora_weights(repo, weight_name=weight)
+            STEPS, CFG = 4, 1.0
+            print(f"[lightning] loaded {weight} -> {STEPS} steps, cfg {CFG}")
+        except Exception as e:
+            # The only published Lightning LoRA is for 2509. If it will not apply
+            # to the 2511 transformer, degrade to full sampling rather than dying:
+            # a slow server beats no server.
+            print(f"[lightning] FAILED to load ({type(e).__name__}: {e})")
+            print("[lightning] falling back to full 40-step sampling")
+            STEPS, CFG = 40, 4.0
     else:
         STEPS, CFG = 40, 4.0
 
@@ -152,6 +177,10 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8188)
     ap.add_argument("--quant", choices=["nunchaku", "fp8", "none"], default="nunchaku")
     ap.add_argument("--no-lightning", action="store_true", help="full 40-step sampling instead of 4-step Lightning")
+    ap.add_argument("--nunchaku-variant", default=NUNCHAKU_VARIANT,
+                    choices=["ultimate_speed", "balance", "best_quality"],
+                    help="INT4 build to load with --quant nunchaku (speed vs quality)")
     args = ap.parse_args()
+    NUNCHAKU_VARIANT = args.nunchaku_variant
     load_pipeline(args.quant, not args.no_lightning)
     uvicorn.run(app, host=args.host, port=args.port)
