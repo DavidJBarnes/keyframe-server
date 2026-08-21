@@ -1,8 +1,27 @@
+# server.py — local Qwen-Image-Edit-2511 endpoint
+#
+# Python 3.11 or 3.12. NOT 3.13: the nunchaku wheel requires <3.13.
+#
+# Install torch FIRST, matching your CUDA build — it is not pinned here because
+# the right wheel depends on your driver:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
 fastapi
 uvicorn
 diffusers
 transformers
 accelerate
-torchao
+safetensors
+sentencepiece
+protobuf
 pillow
-nunchaku
+requests
+torchao          # only needed for --quant fp8
+
+# nunchaku (--quant nunchaku) is NOT installable from PyPI.
+# The name "nunchaku" on PyPI is an unrelated package for piecewise-linear
+# data partitioning. The SVDQuant nunchaku ships prebuilt wheels from its
+# GitHub releases, pinned to both Python and torch version, e.g.
+#   nunchaku-<ver>+torch<X.Y>-cp311-cp311-linux_x86_64.whl
+# Grab the wheel matching your venv from:
+#   https://github.com/mit-han-lab/nunchaku/releases
