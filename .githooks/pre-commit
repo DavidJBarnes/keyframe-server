@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Block PNG/JPEG/MP4 from ever entering a commit, even with `git add -f`.
+set -uo pipefail
+
+blocked=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -Ei '\.(png|jpe?g|mp4)$' || true)
+
+if [ -n "$blocked" ]; then
+  echo "ERROR: media files cannot be committed to this repo:" >&2
+  echo "$blocked" | sed 's/^/  - /' >&2
+  echo >&2
+  echo "Unstage them with:  git restore --staged <file>" >&2
+  echo "Override (rarely):  git commit --no-verify" >&2
+  exit 1
+fi

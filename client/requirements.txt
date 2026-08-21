@@ -1,0 +1,13 @@
+# generate.py — keyframe generation client
+requests>=2.31
+Pillow>=10.0      # only used with --size normalization
+fal-client>=0.5   # only needed for --model qwen/nb2/pro (fal backends)
+
+# qwen_edit_server.py — local Qwen-Image-Edit-2511 server (install on the GPU box)
+# fastapi
+# uvicorn
+# diffusers
+# transformers
+# accelerate
+# torchao        # for --quant fp8
+# nunchaku       # for --quant nunchaku (verify wheel for your torch/cuda)

@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+diffusers
+transformers
+accelerate
+torchao
+pillow
+nunchaku
