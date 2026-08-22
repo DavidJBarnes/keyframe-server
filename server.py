@@ -154,19 +154,37 @@ def load_pipeline(quant: str, lightning: bool):
 
     if lightning:
         repo, weight = LIGHTNING_LORA
+        applied = False
         try:
             pipe.load_lora_weights(repo, weight_name=weight)
-            STEPS, CFG = 4, 1.0
-            print(f"[lightning] loaded {weight} -> {STEPS} steps, cfg {CFG}")
+            # A clean return does NOT mean the LoRA applied. When a target module
+            # is unsupported — nunchaku's quantised SVDQW4A4Linear is — diffusers
+            # logs "Loading default_0 was unsuccessful" and returns normally. Left
+            # unchecked that silently yields 4-step sampling with no Lightning,
+            # i.e. garbage. Verify an adapter is actually active.
+            try:
+                applied = bool(pipe.get_active_adapters())
+            except Exception:
+                # Older diffusers without the introspection API: fall back to
+                # checking whether any LoRA layers were attached.
+                applied = bool(getattr(pipe, "peft_config", None))
         except Exception as e:
-            # The only published Lightning LoRA is for 2509. If it will not apply
-            # to the 2511 transformer, degrade to full sampling rather than dying:
-            # a slow server beats no server.
-            print(f"[lightning] FAILED to load ({type(e).__name__}: {e})")
+            print(f"[lightning] load raised ({type(e).__name__}: {e})")
+
+        if applied:
+            STEPS, CFG = 4, 1.0
+            print(f"[lightning] active -> {STEPS} steps, cfg {CFG}")
+        else:
+            # Known case: --quant nunchaku. PEFT cannot patch INT4 SVDQuant
+            # layers, so Lightning and nunchaku are mutually exclusive today.
+            # Full sampling is correct-but-slow; 4 steps here would be wrong.
+            print("[lightning] NOT applied (unsupported target modules?)")
             print("[lightning] falling back to full 40-step sampling")
             STEPS, CFG = 40, 4.0
     else:
         STEPS, CFG = 40, 4.0
+
+    print(f"[pipeline] ready: quant={quant} steps={STEPS} cfg={CFG}")
 
     PIPE = pipe
 
