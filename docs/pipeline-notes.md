@@ -311,8 +311,10 @@ as a request to show before and after.
   §7a. The four POC shots above predate it and were generated on fal (`--model qwen`);
   re-baseline keyframe look if you switch them to the local backend, since fal's hosted
   2511 and this fp8 build will not match pixel for pixel.
-- `--quant fp8` at 72 s per edit is ~10x slower than fal. nunchaku int4 was the intended
-  fix and is blocked upstream (§7a); revisit when nunchaku supports diffusers 0.40.
+- `--quant fp8` runs ~72 s per edit. Fal is faster but not dramatically so (David,
+  2026-08-22) — no side-by-side timing has been taken, so treat both as unmeasured
+  against each other. At this latency the local server is a viable primary path, not
+  only a cost fallback. nunchaku int4 would still help and is blocked upstream (§7a).
 - Steps 3 and 5 are mechanical and should be a script — crop-by-face-target and a
   framing-consistency assertion that fails loudly on outliers.
 - The richmond phantom hand was never fixed; the prescribed fix (a keyframe at 97) is
