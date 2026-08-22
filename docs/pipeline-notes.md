@@ -232,11 +232,87 @@ under-specified poses are exaggerated.
 7. LTX at `0/33/73/97/121`, strengths `1.0/0.65/0.7/0.75/0.9`
 8. Optional FaceFusion post-pass on the MP4 (`wanly/experiment/faceswap.sh`)
 
+## 7a. Running the local edit server (2026-08-22)
+
+Stood up on 3090.zero, port **8189** (8188 is ComfyUI). Working config:
+
+```bash
+cd ~/keyframe-server
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  ./venv/bin/python server.py --quant fp8 --port 8189 --host 0.0.0.0
+```
+
+Measured on a 512x768 input, RTX 3090:
+
+| | latency | notes |
+|---|---|---|
+| first request (cold) | 98 s | includes moving weights to GPU |
+| warm, 4-step Lightning | **72 s** | the working default |
+| warm, 40-step cfg 4.0 | 200 s | via per-request override |
+
+Output comes back at **832x1248** regardless of a 512x768 input — the model picks its
+own resolution, so normalise afterwards if you need exact conditioning dimensions.
+
+### Quant modes: what actually works
+
+- **`--quant fp8`** — the one that works. torchao float8 weight-only halves the
+  transformer to ~20 GB, which fits as a single resident component under
+  `enable_model_cpu_offload()`. Lightning applies, so 4-step sampling is available.
+- **`--quant none`** — **OOMs.** `enable_model_cpu_offload()` swaps *whole models*, and
+  the bf16 20B transformer is ~40 GB, so it can never fit in 23.5 GB no matter how the
+  rest is scheduled. Would need `enable_sequential_cpu_offload()` (submodule-level, far
+  slower) to work at all.
+- **`--quant nunchaku`** — **blocked upstream.** See below.
+
+### nunchaku is currently unusable with diffusers 0.40
+
+Two independent blockers, both worth knowing before spending 12.65 GB again:
+
+1. **API mismatch.** nunchaku 1.3.0dev20260306 calls
+   `self.pos_embed(img_shapes, txt_seq_lens, device=...)`, but diffusers 0.40 changed
+   the signature to `QwenEmbedRope.forward(video_fhw, device=None, max_txt_seq_len=None)`
+   — so `txt_seq_lens` lands in the `device` slot and it dies with
+   `TypeError: got multiple values for argument 'device'`. nunchaku declares
+   `diffusers>=0.36` but its CI pins `==0.36`; the `>=` is simply wrong.
+2. **Lightning is mutually exclusive with nunchaku.** PEFT cannot patch the INT4
+   `SVDQW4A4Linear` layers, so the LoRA never attaches and you are stuck at 40 steps —
+   which erases much of the speed advantage the INT4 residency was for.
+
+The int4 weights and a matching cp311/torch2.12 wheel are on disk if this gets fixed
+upstream. Note the wheel needs torch **<=2.12** — there is no 2.13 build.
+
+### The Lightning LoRA works on 2511
+
+Despite no 2511 LoRA being published, the **2509** 4-step LoRA applies cleanly to the
+2511 bf16 transformer and gives correct 4-step output — `[lightning] active -> 4 steps`.
+It only fails under nunchaku, for the quantised-layer reason above.
+
+**Verify it actually attached.** `load_lora_weights()` can return normally having applied
+nothing — diffusers logs "Loading default_0 was unsuccessful" and carries on, leaving you
+at 4 steps with no LoRA, i.e. garbage rather than an error. `server.py` now checks
+`get_active_adapters()` and falls back to 40 steps when empty.
+
+### Prompt phrasing: avoid accidental diptychs
+
+`"The same woman in the same RV interior, now wearing a red beanie"` produced a
+**side-by-side pair** — her twice, once edited once not — at both 4 and 40 steps, so it
+is a prompt effect and not a sampling artifact. `"Change her shirt to a dark green
+sweater. Keep everything else identical."` produced a clean single subject.
+
+Prefer **imperative** edit phrasing (`Change X to Y. Keep everything else identical.`)
+over **descriptive restatement** (`The same woman, now with X`), which the model can read
+as a request to show before and after.
+
+---
+
 ## 8. Open items for productionalising
 
-- No edit server is deployed. Everything above ran on fal (`--model qwen`). The 3090 has
-  a broken partial Qwen download (25 `.incomplete`, 0 finished safetensors) and an empty
-  venv at `~/keyframe-server`. See root README for the standup.
+- The edit server now runs on 3090.zero:8189 (`--quant fp8`, 4-step Lightning) — see
+  §7a. The four POC shots above predate it and were generated on fal (`--model qwen`);
+  re-baseline keyframe look if you switch them to the local backend, since fal's hosted
+  2511 and this fp8 build will not match pixel for pixel.
+- `--quant fp8` at 72 s per edit is ~10x slower than fal. nunchaku int4 was the intended
+  fix and is blocked upstream (§7a); revisit when nunchaku supports diffusers 0.40.
 - Steps 3 and 5 are mechanical and should be a script — crop-by-face-target and a
   framing-consistency assertion that fails loudly on outliers.
 - The richmond phantom hand was never fixed; the prescribed fix (a keyframe at 97) is
