@@ -34,6 +34,9 @@ Usage:
 
   # N variants, reproducible seed (seed honored by local backend)
   ./generate.py -i opening.png -p "..." -o kf2.png -n 4 --seed 42
+
+  # override the server's sampler for a hard edit (local backend only)
+  ./generate.py -i opening.png -p "..." -o kf2.png --steps 40 --cfg 4.0
 """
 import argparse
 import base64
@@ -156,10 +159,22 @@ def main():
                     help=f"local server URL (default {DEFAULT_SERVER}; env QWEN_EDIT_URL)")
     ap.add_argument("--seed", type=int, default=None,
                     help="generation seed (honored by the local backend)")
+    ap.add_argument("--steps", type=int, default=None, metavar="N",
+                    help="sampling steps (local only). Default: let the server decide — "
+                         "4 when its Lightning LoRA is active, 40 when it is not. Only "
+                         "override when you know which the server resolved.")
+    ap.add_argument("--cfg", type=float, default=None, metavar="F",
+                    help="true_cfg_scale (local only). Default: server's value, which "
+                         "pairs with its step count (1.0 for 4-step, 4.0 for 40-step)")
     ap.add_argument("--size", type=parse_size, default=None,
                     help="normalize output to WxH (e.g. 512x768), /32 enforced")
     ap.add_argument("--quiet", action="store_true", help="suppress queue logs")
     args = ap.parse_args()
+
+    if args.steps is not None and args.steps < 1:
+        sys.exit(f"--steps must be >= 1, got {args.steps}")
+    if args.cfg is not None and args.cfg <= 0:
+        sys.exit(f"--cfg must be > 0, got {args.cfg}")
 
     image_urls = []
     for src in args.image:
@@ -180,8 +195,21 @@ def main():
     if args.model == "local":
         if args.seed is not None:
             payload["seed"] = args.seed
+        # Steps/cfg deliberately default to None rather than a literal: the correct
+        # value depends on whether the server's Lightning LoRA actually attached, and
+        # only the server knows that. Hardcoding 4 here would silently produce 4-step
+        # sampling on a server running without Lightning — garbage, with no error.
+        if args.steps is not None:
+            payload["num_inference_steps"] = args.steps
+        if args.cfg is not None:
+            payload["true_cfg_scale"] = args.cfg
         result = run_local(args.server, payload)
     else:
+        # fal endpoints reject unknown keys, and pick their own sampler settings.
+        for flag, val in (("--steps", args.steps), ("--cfg", args.cfg), ("--seed", args.seed)):
+            if val is not None:
+                print(f"warning: {flag} is ignored by --model {args.model} (local backend only)",
+                      file=sys.stderr)
         payload["output_format"] = "png"
         result = run_fal(args.model, payload, args.quiet)
 

@@ -47,7 +47,20 @@ export FAL_KEY="key-id:key-secret"     # fal.ai dashboard -> Keys
 
 # N variants, reproducible seed -> writes out_1.png .. out_4.png
 ./client.py -i inputs/wolf/1.png -p "..." -o out.png -n 4 --seed 42
+
+# override the server's sampler for a hard edit (local backend only)
+./client.py -i inputs/wolf/1.png -p "..." -o out.png --steps 40 --cfg 4.0
 ```
+
+**`--steps` / `--cfg` default to the server's own values, deliberately.** The right step
+count depends on whether the server's Lightning LoRA actually attached — 4 steps when it
+did, 40 when it did not — and only the server knows which. Hardcoding 4 client-side would
+silently produce 4-step sampling against a server running without Lightning, which yields
+garbage with no error. Override only when you know what the server resolved; it logs
+`[pipeline] ready: quant=... steps=... cfg=...` at startup.
+
+Measured on 3090.zero (`--quant fp8`, 1103x1426 input): **44 s** at the 4-step default,
+**192 s** at `--steps 40 --cfg 4.0`.
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -58,6 +71,8 @@ export FAL_KEY="key-id:key-secret"     # fal.ai dashboard -> Keys
 | `--model` | `local` | `local`, `qwen`, `nb2`, `pro` |
 | `--server` | `http://localhost:8188/edit` | Local backend URL; env `QWEN_EDIT_URL` |
 | `--seed` | none | Honored by the local backend only |
+| `--steps` | server's | Sampling steps, local only. Server decides by default |
+| `--cfg` | server's | `true_cfg_scale`, local only. Server decides by default |
 | `--size` | none | Resize-to-cover + center-crop to `WxH`, /32 enforced |
 | `--quiet` | off | Suppress fal queue logs |
 
