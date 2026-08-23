@@ -66,6 +66,9 @@ DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8188/edit")
 SERVERS = {
     "local": DEFAULT_SERVER,
     "3090": os.environ.get("QWEN_EDIT_URL_3090", "http://3090.zero:8189/edit"),
+    # RunPod pod IDs change every launch, so there is no sensible built-in default;
+    # it must come from the environment or --server.
+    "runpod": os.environ.get("QWEN_EDIT_URL_RUNPOD", ""),
 }
 
 
@@ -108,11 +111,19 @@ def normalize(img_bytes: bytes, size):
     return im.crop((left, top, left + w, top + h))
 
 
-def run_local(server: str, payload: dict) -> dict:
+def run_local(server: str, payload: dict, api_key: str | None = None) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        r = requests.post(server, json=payload, timeout=600)
+        # 900s: a 40-step edit measured ~192s, and a cold server has to move
+        # weights to the GPU on the first request as well.
+        r = requests.post(server, json=payload, timeout=900, headers=headers)
     except requests.ConnectionError:
         sys.exit(f"cannot reach local server at {server} — is qwen_edit_server.py running?")
+    if r.status_code == 401:
+        sys.exit("server rejected the API key (401). Set --api-key or $KEYFRAME_API_KEY "
+                 "to match the API_KEY the server was started with.")
+    if r.status_code == 503:
+        sys.exit("server is up but the model is still loading (503). Try again shortly.")
     if not r.ok:
         try:
             detail = scrub(r.json())
@@ -167,7 +178,9 @@ def main():
     ap.add_argument("-n", "--num", type=int, default=1, help="variants to generate (1-4)")
     ap.add_argument("--model", choices=[*SERVERS, *FAL_MODELS], default="local",
                     help="backend: local (default, localhost:8188), 3090 (3090.zero:8189), "
-                         "qwen, nb2, pro")
+                         "runpod ($QWEN_EDIT_URL_RUNPOD), qwen, nb2, pro")
+    ap.add_argument("--api-key", default=os.environ.get("KEYFRAME_API_KEY"),
+                    help="Bearer token for a protected server (env KEYFRAME_API_KEY)")
     ap.add_argument("--server", default=None,
                     help="explicit server URL; overrides the host implied by --model "
                          f"(local={SERVERS['local']}, 3090={SERVERS['3090']}; "
@@ -209,6 +222,10 @@ def main():
 
     if args.model in SERVERS:
         server = args.server or SERVERS[args.model]
+        if not server:
+            sys.exit(f"--model {args.model} has no URL. Set "
+                     f"$QWEN_EDIT_URL_{args.model.upper()} or pass --server "
+                     f"https://<podid>-8888.proxy.runpod.net/edit")
         if args.seed is not None:
             payload["seed"] = args.seed
         # Steps/cfg deliberately default to None rather than a literal: the correct
@@ -219,11 +236,12 @@ def main():
             payload["num_inference_steps"] = args.steps
         if args.cfg is not None:
             payload["true_cfg_scale"] = args.cfg
-        result = run_local(server, payload)
+        result = run_local(server, payload, args.api_key)
     else:
         # fal endpoints reject unknown keys, and pick their own sampler settings.
         for flag, val in (("--steps", args.steps), ("--cfg", args.cfg),
-                          ("--seed", args.seed), ("--server", args.server)):
+                          ("--seed", args.seed), ("--server", args.server),
+                          ("--api-key", args.api_key)):
             if val is not None:
                 print(f"warning: {flag} is ignored by --model {args.model} (local backends only)",
                       file=sys.stderr)

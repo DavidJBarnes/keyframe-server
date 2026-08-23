@@ -1,0 +1,15 @@
+# Build context is the repo root (Dockerfile needs server.py). Keep the generated
+# media and venvs out — they are gitignored but still on disk, and would other-
+# wise be uploaded to the daemon on every build.
+client/inputs/
+client/outputs/
+client/venv/
+venv/
+docs/
+.git/
+.githooks/
+**/__pycache__/
+*.png
+*.jpg
+*.jpeg
+*.mp4
