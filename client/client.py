@@ -2,7 +2,8 @@
 """generate.py — keyframe generation for LTX multi-frame conditioning.
 
 Backends:
-  local : your Qwen-Image-Edit-2511 server (qwen_edit_server.py)  [default]
+  local : your Qwen-Image-Edit-2511 server on localhost:8188      [default]
+  3090  : the same server on 3090.zero:8189
   qwen  : fal-ai/qwen-image-edit-2511
   nb2   : fal-ai/nano-banana-2/edit
   pro   : fal-ai/nano-banana-pro/edit
@@ -17,8 +18,11 @@ Usage:
   # local server (default) — start qwen_edit_server.py first
   ./generate.py -i opening.png -p "same woman, now holding a glass of water" -o kf2.png
 
-  # override server location (default http://localhost:8188/edit, or $QWEN_EDIT_URL)
-  ./generate.py --server http://3090.zero:8188/edit -i opening.png -p "..." -o kf2.png
+  # the GPU box, without spelling out the URL (port 8189: 8188 is ComfyUI there)
+  ./generate.py --model 3090 -i opening.png -p "..." -o kf2.png
+
+  # or an explicit server (default http://localhost:8188/edit, or $QWEN_EDIT_URL)
+  ./generate.py --server http://otherhost:8189/edit -i opening.png -p "..." -o kf2.png
 
   # fal backends (require: export FAL_KEY="key-id:key-secret")
   ./generate.py --model qwen -i opening.png -p "..." -o kf2.png
@@ -55,6 +59,14 @@ FAL_MODELS = {
     "pro": "fal-ai/nano-banana-pro/edit",
 }
 DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8188/edit")
+
+# Named local backends, so the common hosts don't need --server spelled out.
+# "3090" is the GPU box: the edit server listens on 8189 there because 8188 is
+# already ComfyUI. Nothing serves port 80 on that host, so the port is required.
+SERVERS = {
+    "local": DEFAULT_SERVER,
+    "3090": os.environ.get("QWEN_EDIT_URL_3090", "http://3090.zero:8189/edit"),
+}
 
 
 def parse_size(s: str):
@@ -153,10 +165,13 @@ def main():
     ap.add_argument("-p", "--prompt", required=True, help="edit instruction")
     ap.add_argument("-o", "--output", required=True, help="output path (.png)")
     ap.add_argument("-n", "--num", type=int, default=1, help="variants to generate (1-4)")
-    ap.add_argument("--model", choices=["local", *FAL_MODELS], default="local",
-                    help="backend: local (default), qwen, nb2, pro")
-    ap.add_argument("--server", default=DEFAULT_SERVER,
-                    help=f"local server URL (default {DEFAULT_SERVER}; env QWEN_EDIT_URL)")
+    ap.add_argument("--model", choices=[*SERVERS, *FAL_MODELS], default="local",
+                    help="backend: local (default, localhost:8188), 3090 (3090.zero:8189), "
+                         "qwen, nb2, pro")
+    ap.add_argument("--server", default=None,
+                    help="explicit server URL; overrides the host implied by --model "
+                         f"(local={SERVERS['local']}, 3090={SERVERS['3090']}; "
+                         "env QWEN_EDIT_URL / QWEN_EDIT_URL_3090)")
     ap.add_argument("--seed", type=int, default=None,
                     help="generation seed (honored by the local backend)")
     ap.add_argument("--steps", type=int, default=None, metavar="N",
@@ -192,7 +207,8 @@ def main():
         "num_images": max(1, min(args.num, 4)),
     }
 
-    if args.model == "local":
+    if args.model in SERVERS:
+        server = args.server or SERVERS[args.model]
         if args.seed is not None:
             payload["seed"] = args.seed
         # Steps/cfg deliberately default to None rather than a literal: the correct
@@ -203,12 +219,13 @@ def main():
             payload["num_inference_steps"] = args.steps
         if args.cfg is not None:
             payload["true_cfg_scale"] = args.cfg
-        result = run_local(args.server, payload)
+        result = run_local(server, payload)
     else:
         # fal endpoints reject unknown keys, and pick their own sampler settings.
-        for flag, val in (("--steps", args.steps), ("--cfg", args.cfg), ("--seed", args.seed)):
+        for flag, val in (("--steps", args.steps), ("--cfg", args.cfg),
+                          ("--seed", args.seed), ("--server", args.server)):
             if val is not None:
-                print(f"warning: {flag} is ignored by --model {args.model} (local backend only)",
+                print(f"warning: {flag} is ignored by --model {args.model} (local backends only)",
                       file=sys.stderr)
         payload["output_format"] = "png"
         result = run_fal(args.model, payload, args.quiet)

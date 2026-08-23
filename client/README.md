@@ -30,8 +30,11 @@ export FAL_KEY="key-id:key-secret"     # fal.ai dashboard -> Keys
 # local server (default) — start ../server.py first
 ./client.py -i inputs/wolf/1.png -p "same woman, now waving at someone off to her right" -o inputs/wolf/3.png
 
-# point at the GPU box instead of localhost
-./client.py --server http://3090.zero:8188/edit -i inputs/wolf/1.png -p "..." -o out.png
+# point at the GPU box — --model 3090 is shorthand for its URL
+./client.py --model 3090 -i inputs/wolf/1.png -p "..." -o out.png
+
+# or an explicit server
+./client.py --server http://otherhost:8189/edit -i inputs/wolf/1.png -p "..." -o out.png
 
 # fal backends
 ./client.py --model qwen -i inputs/wolf/1.png -p "..." -o out.png
@@ -68,8 +71,12 @@ Measured on 3090.zero (`--quant fp8`, 1103x1426 input): **44 s** at the 4-step d
 | `-p, --prompt` | — | Edit instruction |
 | `-o, --output` | — | Output path (`.png`) |
 | `-n, --num` | `1` | Variants, 1–4; >1 suffixes `_1`.. `_N` |
-| `--model` | `local` | `local`, `qwen`, `nb2`, `pro` |
-| `--server` | `http://localhost:8188/edit` | Local backend URL; env `QWEN_EDIT_URL` |
+| `--model` | `local` | `local`, `3090`, `qwen`, `nb2`, `pro` |
+| `--server` | from `--model` | Explicit URL, overrides the host `--model` implies |
+
+**Local backends:** `local` → `http://localhost:8188/edit` (env `QWEN_EDIT_URL`),
+`3090` → `http://3090.zero:8189/edit` (env `QWEN_EDIT_URL_3090`). Note the **8189** on the
+GPU box — 8188 is ComfyUI there, and nothing serves port 80, so the port is not optional.
 | `--seed` | none | Honored by the local backend only |
 | `--steps` | server's | Sampling steps, local only. Server decides by default |
 | `--cfg` | server's | `true_cfg_scale`, local only. Server decides by default |
