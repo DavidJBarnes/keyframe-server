@@ -21,11 +21,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # different build. Default PyPI wheels bundle their own CUDA runtime.
 RUN pip install --no-cache-dir "torch==2.12.1" "torchvision==0.27.1"
 
+# peft is REQUIRED and is not a hard dependency of diffusers. Without it the
+# Lightning LoRA cannot patch any layer, and load_lora_weights fails with
+# "unsupported target modules" — which silently drops the server to 40-step
+# sampling instead of 4-step.
 RUN pip install --no-cache-dir \
         "diffusers==0.40.0" \
         "transformers==5.15.1" \
         "accelerate==1.14.0" \
         "torchao==0.18.0" \
+        "peft==0.20.0" \
         "safetensors" "sentencepiece" "protobuf" \
         "fastapi==0.141.1" "uvicorn==0.52.4" \
         "pillow" "requests" \
@@ -42,6 +47,11 @@ ENV HF_HOME=/workspace/hf \
 # API_KEY is intentionally NOT declared here — it is a runtime secret,
 # supplied by the RunPod template. auth-proxy.py defaults it to empty
 # and warns loudly when unset.
+# Stamped by CI so a running container can be traced to a commit; mismatched
+# images are otherwise invisible until behaviour differs.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
+
 COPY server.py /opt/server.py
 COPY docker/provision.sh /opt/provision.sh
 COPY docker/auth-proxy.py /opt/auth-proxy.py

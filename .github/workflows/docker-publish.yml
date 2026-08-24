@@ -35,6 +35,8 @@ jobs:
           # from there; the Dockerfile itself lives under docker/.
           file: docker/Dockerfile
           push: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           tags: |
             davidjbarnes/keyframe-server:latest
             davidjbarnes/keyframe-server:${{ github.sha }}

@@ -2,6 +2,7 @@
 set -uo pipefail
 echo "============================================"
 echo "  keyframe-server — starting $(date -Is)"
+echo "  image build: ${GIT_SHA:-unknown}"
 echo "============================================"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "WARNING: no GPU visible"
 
