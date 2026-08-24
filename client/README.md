@@ -84,12 +84,12 @@ Measured on 3090.zero (`--quant fp8`, 1103x1426 input): **44 s** at the 4-step d
 
 | `--model` | resolves to | env override |
 |---|---|---|
-| `local` | `http://localhost:8188/edit` | `QWEN_EDIT_URL` |
+| `local` | `http://localhost:8189/edit` | `QWEN_EDIT_URL` |
 | `3090` | `http://3090.zero:8189/edit` | `QWEN_EDIT_URL_3090` |
 | `runpod` | *(no default — pod IDs change)* | `QWEN_EDIT_URL_RUNPOD` |
 
-Note the **8189** on the GPU box — 8188 is ComfyUI there, and nothing serves port 80, so
-the port is not optional. For RunPod the URL looks like
+Both local backends use **8189** — ComfyUI conventionally owns 8188, and nothing serves
+port 80 on the GPU box, so the port is not optional. For RunPod the URL looks like
 `https://<podid>-8888.proxy.runpod.net/edit`, and you will want `--api-key` with it
 (see [docker/README.md](../docker/README.md)).
 

@@ -18,15 +18,24 @@ Lightning LoRA (4-step) is loaded by default; disable with --no-lightning
 for full 40-step quality on hard edits.
 
 Run:
-  python server.py --host 0.0.0.0 --port 8189 --quant fp8
+  python server.py
 
-Port 8189 rather than 8188: ComfyUI commonly occupies 8188 on these boxes.
+Defaults are the validated ones: --quant fp8, --port 8189 (8188 is usually
+ComfyUI), 4-step Lightning, and expandable_segments to limit fragmentation.
 """
 import argparse
 import base64
 import io
+import os
 import re
+import socket
+import sys
 import uuid
+
+# Must be set before torch creates a CUDA context. fp8 leaves a narrow margin on
+# a 24GB card and fragmentation alone can push an edit into OOM, so default it on
+# rather than making every caller remember the env var.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import uvicorn
@@ -121,6 +130,29 @@ def health():
     return {"status": "ok", "vram_free_gb": round(free / 1e9, 2), "vram_total_gb": round(total / 1e9, 2)}
 
 
+def assert_port_free(host: str, port: int):
+    """Fail before loading weights, not after.
+
+    uvicorn binds only once load_pipeline() returns, so a port collision
+    surfaces several minutes in — the model loads fine and then the process
+    dies on "address already in use". ComfyUI habitually occupies 8188 on these
+    boxes, which is exactly how this bites.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((host, port))
+    except OSError as e:
+        sys.exit(
+            f"port {port} on {host} is already in use ({e.strerror}).\n"
+            f"Something else is listening — ComfyUI commonly holds 8188.\n"
+            f"Pass a free port, e.g. --port 8189, or stop the other process.\n"
+            f"Checked before loading the model so you don't wait minutes to find out."
+        )
+    finally:
+        probe.close()
+
+
 def load_pipeline(quant: str, lightning: bool):
     global PIPE, STEPS, CFG
     from diffusers import QwenImageEditPipeline
@@ -195,7 +227,8 @@ def load_pipeline(quant: str, lightning: bool):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8188)
+    # 8189 rather than 8188: ComfyUI conventionally owns 8188 on these boxes.
+    ap.add_argument("--port", type=int, default=8189)
     # fp8 is the default because it is the only mode verified working on a 24GB
     # card: nunchaku is broken against diffusers 0.40, and bf16 ("none") OOMs
     # because model-level offload cannot fit a ~40GB transformer in 23.5GB.
@@ -206,5 +239,6 @@ if __name__ == "__main__":
                     help="INT4 build to load with --quant nunchaku (speed vs quality)")
     args = ap.parse_args()
     NUNCHAKU_VARIANT = args.nunchaku_variant
+    assert_port_free(args.host, args.port)
     load_pipeline(args.quant, not args.no_lightning)
     uvicorn.run(app, host=args.host, port=args.port)

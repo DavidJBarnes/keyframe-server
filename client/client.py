@@ -58,7 +58,7 @@ FAL_MODELS = {
     "nb2": "fal-ai/nano-banana-2/edit",
     "pro": "fal-ai/nano-banana-pro/edit",
 }
-DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8188/edit")
+DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8189/edit")
 
 # Named local backends, so the common hosts don't need --server spelled out.
 # "3090" is the GPU box: the edit server listens on 8189 there because 8188 is

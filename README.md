@@ -24,10 +24,15 @@ you — see [docker/README.md](docker/README.md).
 ### Locally
 
 ```bash
-python server.py --quant fp8 --port 8189
+python server.py
 ```
 
-Port **8189**, not 8188: ComfyUI commonly occupies 8188 on GPU boxes.
+That's it — the defaults are the validated ones: `--quant fp8`, `--port 8189`
+(8188 is usually ComfyUI), 4-step Lightning, and `expandable_segments` set
+internally to limit CUDA fragmentation.
+
+The port is checked **before** the model loads, so a collision fails in a second
+rather than after several minutes of loading.
 
 **Setup:**
 
@@ -70,7 +75,7 @@ want the cache elsewhere — on RunPod it must point at the network volume.
 | Flag | Default | Notes |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8188` | Listen port — pass `8189` if ComfyUI has 8188 |
+| `--port` | `8189` | Listen port. 8188 avoided — ComfyUI usually has it |
 | `--quant` | `fp8` | `fp8` \| `none` \| `nunchaku` — see below |
 | `--no-lightning` | off | Full 40-step sampling at CFG 4.0 instead of 4-step Lightning |
 | `--nunchaku-variant` | `balance` | Only relevant if nunchaku is ever fixed |
@@ -140,7 +145,7 @@ make the model emit a side-by-side before/after pair. See `docs/pipeline-notes.m
 **Running it as a background service:**
 
 ```bash
-nohup python server.py --quant fp8 --port 8189 > server.log 2>&1 &
+nohup python server.py > server.log 2>&1 &
 tail -f server.log
 ```
 
