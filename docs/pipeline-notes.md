@@ -305,6 +305,47 @@ as a request to show before and after.
 
 ---
 
+## 7b. Do not raise --cfg. The default is the best config. (2026-08-24)
+
+Classifier-free guidance was never active: diffusers gates it on
+`do_true_cfg = true_cfg_scale > 1 and has_neg_prompt`, and the server sent no
+negative prompt, so every request ever made ran with guidance off. `--cfg` looked
+honoured and did nothing.
+
+Fixing that turned out **not** to be an improvement. Same source, same seed, same
+prompt ("Change her red top to a purple sleeveless tank top"):
+
+| config | result | time |
+|---|---|---|
+| **4-step Lightning, cfg 1.0 (default)** | **correct, photoreal** | **44 s** |
+| 40-step, cfg 4.0, Lightning on | turned the whole frame into a cartoon | 367 s |
+| 40-step, cfg 4.0, Lightning off | photoreal but the edit never happened — garment unchanged | 396 s |
+
+The Lightning LoRA is trained for 4 steps at cfg 1.0; pushing steps and guidance
+over-cooks it into stylisation. Removing Lightning fixes the stylisation and loses
+the edit instead.
+
+**So: leave the sampler alone.** The default 4-step path is both the highest quality
+and ~8x the fastest. `--steps` / `--cfg` remain available for experimentation but
+neither has yet produced a better result than the default on any test.
+
+### When an edit does not take
+
+The default config handles garment-type changes (sweater to sleeveless tank) and
+colour changes correctly. When an edit comes back wrong — colour changed but not
+garment type, or the wrong colour entirely — the cause is prompt or seed, not
+configuration. In order of what actually helps:
+
+1. **Re-roll the seed.** Edits are stochastic; a failed edit at one seed often
+   succeeds at the next.
+2. **Use imperative phrasing.** `"Change X to Y. Keep everything else identical."`
+   beats `"the same woman, now wearing Y"` (§3).
+3. **Name the structure explicitly** — "sleeveless tank top" rather than "tank top",
+   since garment-type changes are structural and the model under-commits to them
+   more readily than to colour.
+
+---
+
 ## 8. Open items for productionalising
 
 - The edit server now runs on 3090.zero:8189 (`--quant fp8`, 4-step Lightning) — see

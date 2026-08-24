@@ -99,10 +99,15 @@ device=...)`, but diffusers 0.40 changed the signature to
 steps — which removes most of the reason to want INT4 in the first place. Its wheels
 also top out at torch 2.12.
 
-**Quality vs speed:** the Lightning LoRA is loaded by default (4 steps, cfg 1.0). For
-hard edits, `--no-lightning` gives full 40-step sampling at cfg 4.0. Per-request
-overrides beat both — `num_inference_steps` and `true_cfg_scale` in the POST body, or
-`--steps` / `--cfg` on the client.
+**Leave the sampler alone.** The default (4-step Lightning, cfg 1.0) has produced the
+best result on every test so far, and is ~8x faster than the alternatives. Raising
+`--steps`/`--cfg` measurably makes things *worse*: with Lightning attached it stylises
+the whole frame into a cartoon, and with `--no-lightning` the edit stops happening at
+all. Details and numbers in `docs/pipeline-notes.md` §7b.
+
+If an edit comes back wrong, re-roll the seed and use imperative phrasing
+(`"Change X to Y. Keep everything else identical."`) rather than reaching for the
+sampler knobs.
 
 The server prints what it actually resolved at startup, which is worth reading rather
 than assuming:
