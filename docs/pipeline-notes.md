@@ -390,6 +390,46 @@ an explicit prompt is 3.5x faster and structurally correct.
 
 ---
 
+## 7d. Vetting LoRAs from Civitai (2026-08-24)
+
+Civitai's **"Qwen" base-model filter is not sufficient.** It says nothing about the
+adapter *format*, and LyCORIS variants are listed under the same "LORA" type.
+
+Three things must all hold:
+
+1. **Format must be true LoRA** (`lora_down`/`lora_up` or `lora_A`/`lora_B`).
+   diffusers ships ~24 converters, none of which handle **LoKr** or **LoHa**. A LoKr
+   fails with `ValueError: state_dict should be empty at this point` — an error that
+   does not mention the real cause. ComfyUI loads these because it implements
+   LyCORIS; diffusers does not.
+2. **Naming** — kohya (`lora_unet_*`), ComfyUI (`diffusion_model.*`) and
+   diffusers-native (`transformer.*`) are all handled by
+   `_convert_non_diffusers_qwen_lora_to_diffusers`.
+3. **Architecture** — should cover 60 transformer blocks (0-59). Qwen-Image and
+   Qwen-Image-Edit share the transformer backbone, so t2i-trained LoRAs generally
+   load; whether they *look* right on an edit model is a separate question.
+
+Check before downloading a gigabyte:
+
+```bash
+./tools/check_lora.py ~/models/qwen/whatever.safetensors
+```
+
+Reads only the safetensors header — no torch, no GPU. Exits non-zero when the
+adapter cannot be loaded.
+
+**Metadata worth reading** when present: `ss_network_module` is the giveaway —
+`lycoris.kohya` means LoKr/LoHa and will not load, while a plain `networks.lora`
+will. `ss_base_model_version` distinguishes `qwen_image` from the edit variants.
+
+**Caveat for the planned `--lora` flag:** the Lightning LoRA is already attached at
+startup, so a runtime LoRA would be a second adapter. PEFT supports stacking, but it
+changes sampling behaviour — `--lora` should probably imply `--no-lightning`, or at
+minimum warn. The fp8 path also routes LoRA through torchao's `TorchaoLoraLinear`,
+which disables `merge()`/`unmerge()`; forward works, merging does not.
+
+---
+
 ## 8. Open items for productionalising
 
 - The edit server now runs on 3090.zero:8189 (`--quant fp8`, 4-step Lightning) — see
