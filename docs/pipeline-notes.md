@@ -346,6 +346,50 @@ configuration. In order of what actually helps:
 
 ---
 
+## 7c. Garment swaps need explicit structure (2026-08-24)
+
+`"Change her sweater to a purple tank top. Keep everything else identical."` on a
+pink turtleneck reliably **recolours the sweater and leaves it a sweater** — across
+four seeds, both resolutions, and both sampler configs.
+
+What fixes it is naming the structural change, not the garment:
+
+> "Replace her pink turtleneck sweater with a purple sleeveless tank top. She must
+> have **bare shoulders and bare arms, with no sleeves and no collar**. Keep her
+> face, hair, pose and the background exactly the same."
+
+That produced a correct sleeveless purple top at the **4-step default in 90s**.
+
+The model under-commits to structural change because recolouring is a cheaper way to
+satisfy the prompt. Name what must be *absent* — no sleeves, no collar — and what
+skin must be visible, and it commits.
+
+### fal's config, for reference
+
+From `https://fal.ai/api/openapi/queue/openapi.json?endpoint_id=fal-ai/qwen-image-edit-2511`:
+
+| param | fal | ours (default) |
+|---|---|---|
+| `num_inference_steps` | 28 | 4 |
+| `guidance_scale` | 4.5 | 1.0 |
+| `negative_prompt` | `""` — present, so CFG is **on** | none |
+| Lightning LoRA | none | loaded |
+
+Reproducing fal's settings (`--steps 28 --cfg 4.5 --negative ""`) **improves colour
+fidelity** — true purple rather than navy — but does **not** fix the structural swap,
+and costs 312s against 90s. So the config gap is not what blocks garment replacement.
+
+**Use fal's settings when colour accuracy matters**; otherwise the 4-step default with
+an explicit prompt is 3.5x faster and structurally correct.
+
+### What does NOT help
+
+- **Upscaling the input** (512x768 -> 1024x1536): kept the collar and went navy. Worse.
+- **More seeds**: four seeds, all kept the turtleneck.
+- **Raising steps/cfg alone**: see §7b.
+
+---
+
 ## 8. Open items for productionalising
 
 - The edit server now runs on 3090.zero:8189 (`--quant fp8`, 4-step Lightning) — see
