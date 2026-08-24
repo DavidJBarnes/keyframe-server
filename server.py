@@ -139,15 +139,30 @@ def edit(req: EditRequest):
     if cfg > 1 and not negative:
         negative = " "
 
-    out = PIPE(
-        image=images if len(images) > 1 else images[0],
-        prompt=req.prompt,
-        negative_prompt=negative,
-        num_inference_steps=req.num_inference_steps or STEPS,
-        true_cfg_scale=cfg,
-        num_images_per_prompt=req.num_images,
-        generator=gen,
-    )
+    try:
+        out = PIPE(
+            image=images if len(images) > 1 else images[0],
+            prompt=req.prompt,
+            negative_prompt=negative,
+            num_inference_steps=req.num_inference_steps or STEPS,
+            true_cfg_scale=cfg,
+            num_images_per_prompt=req.num_images,
+            generator=gen,
+        )
+    except torch.OutOfMemoryError as e:
+        # Without this the failed run's allocations stay resident and EVERY
+        # subsequent request OOMs too — one transient failure permanently
+        # poisons the server until it is restarted.
+        gc.collect()
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        print(f"[edit] OOM — recovered, vram free {free / 1e9:.1f} / {total / 1e9:.1f} GB",
+              flush=True)
+        raise HTTPException(
+            503,
+            f"GPU out of memory ({free / 1e9:.1f} GB free after cleanup). "
+            "Another process may be holding VRAM; retry shortly.",
+        ) from e
     payload = {
         "images": [
             {
