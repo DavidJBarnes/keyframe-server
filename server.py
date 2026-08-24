@@ -225,6 +225,76 @@ def assert_port_free(host: str, port: int):
         probe.close()
 
 
+def merge_lokr(transformer, path: str, strength: float = 1.0):
+    """Merge a LyCORIS LoKr adapter into transformer weights, in place.
+
+    diffusers has no LoKr converter — load_lora_weights() dies with an unhelpful
+    "state_dict should be empty at this point". But LoKr is simply a Kronecker
+    factorisation of the weight delta:
+
+        dW = (alpha / dim) * kron(w1, w2)
+        W' = W + strength * dW
+
+    so it can be reconstructed with plain torch. Must run on the bf16 weights
+    BEFORE fp8 quantisation: torchao replaces them with tensor subclasses that a
+    bf16 delta cannot cleanly be added to.
+
+    Key names are matched by stripping all separators rather than by mangling
+    underscores back into dots — "to_out_0" -> "to_out.0" but "add_k_proj" keeps
+    its underscores, and no rule distinguishes those reliably.
+    """
+    from safetensors.torch import load_file
+
+    sd = load_file(path)
+    groups: dict[str, dict[str, torch.Tensor]] = {}
+    for k, v in sd.items():
+        base, _, leaf = k.rpartition(".")
+        groups.setdefault(base, {})[leaf] = v
+
+    # normalised model param name -> (real name, parameter)
+    params = {}
+    collisions = 0
+    for name, prm in transformer.named_parameters():
+        if not name.endswith(".weight"):
+            continue
+        norm = name[: -len(".weight")].replace(".", "").replace("_", "").lower()
+        if norm in params:
+            collisions += 1
+        params[norm] = (name, prm)
+    if collisions:
+        print(f"[lokr] WARNING: {collisions} ambiguous parameter names", flush=True)
+
+    merged = skipped = 0
+    with torch.no_grad():
+        for base, parts in groups.items():
+            if "lokr_w1" not in parts or "lokr_w2" not in parts:
+                skipped += 1
+                continue
+            norm = base.replace("lora_unet_", "").replace(".", "").replace("_", "").lower()
+            hit = params.get(norm)
+            if hit is None:
+                skipped += 1
+                continue
+            name, prm = hit
+            w1 = parts["lokr_w1"].to(torch.float32)
+            w2 = parts["lokr_w2"].to(torch.float32)
+            delta = torch.kron(w1, w2)
+            if tuple(delta.shape) != tuple(prm.shape):
+                skipped += 1
+                continue
+            scale = strength
+            if "alpha" in parts:
+                scale *= float(parts["alpha"].item()) / w1.shape[0]
+            prm.add_(delta.to(prm.dtype).to(prm.device) * scale)
+            merged += 1
+
+    print(f"[lokr] merged {merged} modules (skipped {skipped}) "
+          f"from {path} at strength {strength}", flush=True)
+    if merged == 0:
+        print("[lokr] WARNING: nothing merged — names did not match the model", flush=True)
+    return merged
+
+
 def load_pipeline(quant: str, lightning: bool):
     global PIPE, STEPS, CFG, QUANT_MODE
     QUANT_MODE = quant
@@ -258,6 +328,10 @@ def load_pipeline(quant: str, lightning: bool):
         transformer = QwenImageTransformer2DModel.from_pretrained(
             MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16
         )
+        # Merge before quantising — see merge_lokr's docstring.
+        lokr = os.environ.get("LOKR_PATH")
+        if lokr:
+            merge_lokr(transformer, lokr, float(os.environ.get("LOKR_WEIGHT", "1.0")))
         quantize_(transformer, Float8WeightOnlyConfig())
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
