@@ -71,17 +71,27 @@ Measured on 3090.zero (`--quant fp8`, 1103x1426 input): **44 s** at the 4-step d
 | `-p, --prompt` | — | Edit instruction |
 | `-o, --output` | — | Output path (`.png`) |
 | `-n, --num` | `1` | Variants, 1–4; >1 suffixes `_1`.. `_N` |
-| `--model` | `local` | `local`, `3090`, `qwen`, `nb2`, `pro` |
+| `--model` | `local` | `local`, `3090`, `runpod`, `qwen`, `nb2`, `pro` |
 | `--server` | from `--model` | Explicit URL, overrides the host `--model` implies |
-
-**Local backends:** `local` → `http://localhost:8188/edit` (env `QWEN_EDIT_URL`),
-`3090` → `http://3090.zero:8189/edit` (env `QWEN_EDIT_URL_3090`). Note the **8189** on the
-GPU box — 8188 is ComfyUI there, and nothing serves port 80, so the port is not optional.
-| `--seed` | none | Honored by the local backend only |
+| `--api-key` | `$KEYFRAME_API_KEY` | Bearer token for a protected server |
+| `--seed` | none | Honored by local backends only |
 | `--steps` | server's | Sampling steps, local only. Server decides by default |
 | `--cfg` | server's | `true_cfg_scale`, local only. Server decides by default |
 | `--size` | none | Resize-to-cover + center-crop to `WxH`, /32 enforced |
 | `--quiet` | off | Suppress fal queue logs |
+
+**Local backends:**
+
+| `--model` | resolves to | env override |
+|---|---|---|
+| `local` | `http://localhost:8188/edit` | `QWEN_EDIT_URL` |
+| `3090` | `http://3090.zero:8189/edit` | `QWEN_EDIT_URL_3090` |
+| `runpod` | *(no default — pod IDs change)* | `QWEN_EDIT_URL_RUNPOD` |
+
+Note the **8189** on the GPU box — 8188 is ComfyUI there, and nothing serves port 80, so
+the port is not optional. For RunPod the URL looks like
+`https://<podid>-8888.proxy.runpod.net/edit`, and you will want `--api-key` with it
+(see [docker/README.md](../docker/README.md)).
 
 Local images are inlined as base64 data URIs — no fal storage upload, no CDN auth. Errors
 are scrubbed so base64 payloads never flood the terminal.

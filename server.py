@@ -5,19 +5,22 @@ Mirrors the fal request/response shape so generate.py can target it with
 --model local. Input: {prompt, image_urls (data URIs or http URLs), num_images}.
 Output: {images: [{url: data URI, content_type, file_name}]}.
 
-Quantization modes (pick per VRAM budget on a 24GB 3090):
-  --quant nunchaku : INT4 SVDQuant transformer (fastest, fits fully in 24GB so
-                     no CPU offload thrash; needs Python <3.13 for the wheel)
-  --quant fp8      : torchao float8 weight-only on the bf16 transformer
-  --quant none     : bf16 + model CPU offload (slowest, max quality)
+Quantization modes, as measured on a 24GB 3090 (2026-08-22):
+  --quant fp8      : DEFAULT and the only mode that works on 24GB. torchao
+                     float8 weight-only, ~20GB transformer, ~44-72s per edit.
+  --quant none     : bf16 + model CPU offload. OOMs on 24GB (the transformer is
+                     ~40GB and offload swaps whole models). Use on 48GB+ cards.
+  --quant nunchaku : BROKEN against diffusers 0.40 -- nunchaku calls a changed
+                     QwenEmbedRope signature. Also mutually exclusive with the
+                     Lightning LoRA, since PEFT cannot patch its INT4 layers.
 
 Lightning LoRA (4-step) is loaded by default; disable with --no-lightning
 for full 40-step quality on hard edits.
 
 Run:
-  python server.py --host 0.0.0.0 --port 8188 --quant nunchaku
+  python server.py --host 0.0.0.0 --port 8189 --quant fp8
 
-Note: on 3090.zero, port 8188 is ComfyUI — use --port 8189 there.
+Port 8189 rather than 8188: ComfyUI commonly occupies 8188 on these boxes.
 """
 import argparse
 import base64
@@ -193,7 +196,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8188)
-    ap.add_argument("--quant", choices=["nunchaku", "fp8", "none"], default="nunchaku")
+    # fp8 is the default because it is the only mode verified working on a 24GB
+    # card: nunchaku is broken against diffusers 0.40, and bf16 ("none") OOMs
+    # because model-level offload cannot fit a ~40GB transformer in 23.5GB.
+    ap.add_argument("--quant", choices=["nunchaku", "fp8", "none"], default="fp8")
     ap.add_argument("--no-lightning", action="store_true", help="full 40-step sampling instead of 4-step Lightning")
     ap.add_argument("--nunchaku-variant", default=NUNCHAKU_VARIANT,
                     choices=["ultimate_speed", "balance", "best_quality"],

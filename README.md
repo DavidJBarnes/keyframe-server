@@ -7,109 +7,120 @@ The server mirrors the fal.ai request/response shape, so the same client can tar
 either a hosted fal endpoint or your own GPU.
 
 - `server.py` — FastAPI wrapper around the Qwen edit pipeline (`POST /edit`, `GET /health`)
-- `client/client.py` — edit-based keyframe factory (fal.ai backends)
+- `client/client.py` — edit-based keyframe factory ([client README](client/README.md))
+- `docker/` — RunPod image and template ([docker README](docker/README.md))
+- `docs/pipeline-notes.md` — measured findings from the proof-of-concept shots
 
 ---
 
 ## How to run
 
-### Server
+### On RunPod (recommended)
+
+The packaged path. `davidjbarnes/keyframe-server` on Docker Hub, RunPod template
+`keyframe-server`. Handles the model download, an auth proxy, and correct flags for
+you — see [docker/README.md](docker/README.md).
+
+### Locally
 
 ```bash
-python server.py --quant nunchaku --port 8188
+python server.py --quant fp8 --port 8189
 ```
 
-That's the standard invocation: INT4 SVDQuant transformer, 4-step Lightning LoRA,
-listening on all interfaces at port 8188.
-
-First run downloads the Qwen-Image-Edit-2511 weights, the Nunchaku transformer, and
-the Lightning LoRA from Hugging Face — expect a long startup and tens of GB of cache.
-Subsequent runs load from `~/.cache/huggingface`.
+Port **8189**, not 8188: ComfyUI commonly occupies 8188 on GPU boxes.
 
 **Setup:**
 
 ```bash
-python -m venv venv
+python3.11 -m venv venv          # 3.11 or 3.12 — see note below
 source venv/bin/activate
+pip install torch torchvision    # install FIRST, on its own
 pip install -r requirements.txt
 ```
 
-`requirements.txt` does not pin `torch` — install the build matching your CUDA
-version first (see pytorch.org), then the rest. `nunchaku` also ships per-GPU-generation
-wheels; check huggingface.co/nunchaku-tech for the right one.
+Install `torch` **before** the rest, and let pip pick the default PyPI wheels — they
+bundle their own CUDA runtime. Pinning an old `--index-url` (e.g. `cu124`) makes pip
+backtrack for a long time hunting for a compatible build and may find none.
 
-**Pre-download the weights** (optional, but recommended — pulls the model outside of
-server startup so a slow or interrupted download doesn't look like a hung server):
+**Python 3.11 or 3.12, not 3.13** — only because the nunchaku wheel requires `<3.13`.
+Since nunchaku is currently broken anyway (below), 3.13 is fine if you never intend to
+use it.
+
+**Pre-download the weights** (optional; moves the multi-GB pull out of server startup so
+a slow download doesn't look like a hung server):
 
 ```bash
 pip install -U "huggingface_hub[cli]"
+
+# base model, 57.7 GB
 hf download Qwen/Qwen-Image-Edit-2511
-```
 
-Everything lands in `~/.cache/huggingface`, which is exactly where the server looks at
-load time — so once this finishes, startup is local-disk only. Set `HF_HOME` first if
-you want the cache somewhere with more room.
-
-Depending on flags, the server also pulls two smaller repos on first run. Grab them
-up front the same way:
-
-```bash
-# --quant nunchaku (the default): INT4 SVDQuant transformer
-hf download nunchaku-tech/nunchaku-qwen-image-edit-2511
-
-# Lightning 4-step LoRA (on unless you pass --no-lightning)
+# Lightning 4-step LoRA, 0.85 GB. Note this is the 2509 file: no 2511 LoRA has ever
+# been published, and the 2509 one applies cleanly to the 2511 transformer.
 hf download lightx2v/Qwen-Image-Lightning \
-    Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+    Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors
 ```
 
-The download resumes if interrupted, so re-running the same command after a dropped
-connection is safe. If the repo is gated, `hf auth login` first.
+Everything lands in `$HF_HOME` (default `~/.cache/huggingface`), which is where the
+server looks at load time. Downloads resume if interrupted. Set `HF_HOME` first if you
+want the cache elsewhere — on RunPod it must point at the network volume.
 
 **Options:**
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8188` | Listen port |
-| `--quant` | `nunchaku` | `nunchaku` \| `fp8` \| `none` |
+| `--port` | `8188` | Listen port — pass `8189` if ComfyUI has 8188 |
+| `--quant` | `fp8` | `fp8` \| `none` \| `nunchaku` — see below |
 | `--no-lightning` | off | Full 40-step sampling at CFG 4.0 instead of 4-step Lightning |
+| `--nunchaku-variant` | `balance` | Only relevant if nunchaku is ever fixed |
 
-**Picking a quant mode** (sized for a 24GB 3090):
+### Quant modes — measured, not theoretical
 
-- `nunchaku` — INT4 SVDQuant. Fastest load, most VRAM headroom. Leaves room to keep
-  LTX partially resident alongside it. This is the one you want by default.
-- `fp8` — torchao float8 weight-only on the bf16 transformer. Middle ground.
-- `none` — plain bf16 with model CPU offload. Slowest, maximum quality.
+On a 24 GB 3090, 512x768 input (2026-08-22):
 
-All three modes call `enable_model_cpu_offload()`, so layers stream to GPU on demand.
+| mode | 24 GB | notes |
+|---|---|---|
+| **`fp8`** | **works — the default** | torchao float8 weight-only, ~20 GB transformer, fits as one resident component under model-level offload. Lightning applies → 4 steps. **~44–72 s/edit** (200 s at 40 steps) |
+| `none` | **OOMs** | `enable_model_cpu_offload()` swaps *whole models*, and the bf16 transformer is ~40 GB — it cannot fit in 23.5 GB regardless of scheduling. Fine on 48 GB+ cards, where it is the better-quality option. |
+| `nunchaku` | **broken** | Two independent blockers — see below |
 
-**Quality vs. speed:** Lightning LoRA is on by default (4 steps, `true_cfg_scale` 1.0).
-For hard compositional edits where 4 steps smears detail, drop it:
+**nunchaku is currently unusable.** It calls `self.pos_embed(img_shapes, txt_seq_lens,
+device=...)`, but diffusers 0.40 changed the signature to
+`QwenEmbedRope.forward(video_fhw, device=None, max_txt_seq_len=None)`, so it dies with
+`TypeError: got multiple values for argument 'device'`. nunchaku declares
+`diffusers>=0.36` while its CI pins `==0.36`. Separately, PEFT cannot patch its INT4
+`SVDQW4A4Linear` layers, so the Lightning LoRA never attaches and you are stuck at 40
+steps — which removes most of the reason to want INT4 in the first place. Its wheels
+also top out at torch 2.12.
 
-```bash
-python server.py --quant nunchaku --port 8188 --no-lightning   # 40 steps, CFG 4.0
+**Quality vs speed:** the Lightning LoRA is loaded by default (4 steps, cfg 1.0). For
+hard edits, `--no-lightning` gives full 40-step sampling at cfg 4.0. Per-request
+overrides beat both — `num_inference_steps` and `true_cfg_scale` in the POST body, or
+`--steps` / `--cfg` on the client.
+
+The server prints what it actually resolved at startup, which is worth reading rather
+than assuming:
+
 ```
-
-Per-request overrides beat both — `num_inference_steps` and `true_cfg_scale` in the
-POST body win over the server defaults.
+[lightning] active -> 4 steps, cfg 1.0
+[pipeline] ready: quant=fp8 steps=4 cfg=1.0
+```
 
 **Verify it's up:**
 
 ```bash
-curl -s localhost:8188/health
+curl -s localhost:8189/health
 # {"status":"ok","vram_free_gb":21.4,"vram_total_gb":25.4}
 ```
-
-`/health` reports live VRAM, which is the fastest way to see whether a model is
-resident or whether something else on the box is eating the card.
 
 **Hitting the endpoint directly:**
 
 ```bash
-curl -s localhost:8188/edit \
+curl -s localhost:8189/edit \
   -H 'content-type: application/json' \
   -d '{
-    "prompt": "same woman, now holding a glass of water",
+    "prompt": "Change her shirt to a dark green sweater. Keep everything else identical.",
     "image_urls": ["data:image/png;base64,iVBORw0KG..."],
     "num_images": 1,
     "seed": 42
@@ -117,50 +128,24 @@ curl -s localhost:8188/edit \
 ```
 
 `image_urls` takes 1–3 entries, each a **data URI** or an **http(s) URL** — file paths
-are rejected. Responses come back as base64 data URIs, not files on disk; the server
-never writes to the filesystem.
+are rejected. Responses come back as base64 data URIs; the server never writes to disk.
+Output resolution is chosen by the model (~1 MP), not by your input.
 
 Optional body fields: `seed`, `num_inference_steps`, `true_cfg_scale`.
+
+**Prompt phrasing matters.** Imperative edits (`"Change X to Y. Keep everything else
+identical."`) behave; descriptive restatement (`"the same woman, now wearing X"`) can
+make the model emit a side-by-side before/after pair. See `docs/pipeline-notes.md`.
 
 **Running it as a background service:**
 
 ```bash
-nohup python server.py --quant nunchaku --port 8188 > server.log 2>&1 &
+nohup python server.py --quant fp8 --port 8189 > server.log 2>&1 &
 tail -f server.log
 ```
 
-Model load happens *before* uvicorn binds the port, so a refused connection during
-the first minute means it's still loading, not that it crashed. `/edit` returns
-`503 pipeline not loaded` only if loading failed outright.
-
-### Client
-
-```bash
-cd client
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-export FAL_KEY="key-id:key-secret"     # fal.ai dashboard -> Keys
-```
-
-```bash
-# one source frame + an instruction
-./client.py -i inputs/pour1.png -p "same woman, now holding a glass of water" -o keyframes/p1.png
-
-# multi-ref: source frame + canonical face reference
-./client.py -i inputs/pour1.png -i inputs/face_ref.png \
-    -p "same woman from image 1 with the face from image 2, tilting the glass toward her chest" \
-    -o keyframes/p2.png
-
-# normalize straight to LTX conditioning size (both dims must be /32)
-./client.py -i inputs/pour1.png -p "..." -o keyframes/p3.png --size 512x768
-
-# N variants to pick from -> writes p4_1.png .. p4_4.png
-./client.py -i inputs/pour1.png -p "..." -o keyframes/p4.png -n 4
-```
-
-Backends via `--model`: `qwen` (default), `nb2`, `pro`, `local`. Local images are
-inlined as base64 data URIs, so there's no fal storage upload and no CDN auth.
-`--size` resizes-to-cover then center-crops to exact conditioning dimensions.
+Model load happens *before* uvicorn binds the port, so a refused connection during the
+first minutes means it's still loading, not that it crashed.
 
 ---
 
