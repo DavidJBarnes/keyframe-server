@@ -30,6 +30,21 @@ update rather than persisting on the volume.
 
 ## RunPod template settings
 
+**Always run with a memory cap.** The transformer sits in host RAM for CPU offload,
+so an unbounded container can exhaust the host and take the whole machine down — not
+just the container. With `--memory` the kernel kills the container instead, and
+`--restart unless-stopped` brings it back:
+
+```bash
+docker run -d --name keyframe-server --restart unless-stopped --gpus all \
+  --memory 48g --memory-swap 48g \
+  -v "$HOME/.cache/huggingface:/workspace/hf" -e SKIP_DOWNLOAD=1 \
+  -p 8189:8888 davidjbarnes/keyframe-server:latest
+```
+
+Size the cap above the model (~42 GB) but below total host RAM, leaving room for the
+OS. On a 61 GB box, 48 GB works.
+
 | Setting | Value |
 |---|---|
 | Container Image | `davidjbarnes/keyframe-server:latest` |

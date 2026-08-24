@@ -202,6 +202,78 @@ def health():
     }
 
 
+# The bf16 transformer is ~40GB and is held in host RAM for CPU offload, so a
+# second server on the same box needs another 40GB. On a 61GB machine that is an
+# OOM, and an OOM here can take the whole host down — which is unrecoverable if
+# nobody can reach the power button.
+APPROX_HOST_RAM_GB = 42.0
+
+
+def assert_enough_ram(quant: str, force: bool = False):
+    """Refuse to start if host RAM cannot hold the model.
+
+    Guards specifically against launching a second server alongside a running
+    one: the port check below won't catch it (different ports are fine) but they
+    share host memory, and losing the box to an OOM is far worse than refusing
+    to boot.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            info = {k.split(":")[0]: int(v.split()[0]) for k, v in
+                    (line.split(":", 1) for line in f)}
+        available_gb = info["MemAvailable"] / 1024 / 1024
+    except Exception as e:
+        print(f"[preflight] could not read /proc/meminfo ({e}); skipping RAM check",
+              flush=True)
+        return
+
+    need = APPROX_HOST_RAM_GB
+    print(f"[preflight] host RAM available {available_gb:.1f} GB, need ~{need:.0f} GB",
+          flush=True)
+    if available_gb >= need:
+        return
+
+    others = []
+    try:
+        import glob
+        for d in glob.glob("/proc/[0-9]*"):
+            try:
+                cmd = open(f"{d}/cmdline", "rb").read().replace(b"\0", b" ").decode()
+            except OSError:
+                continue
+            # Must look like *this* server, not any script named server.py —
+            # a bare name match flags unrelated projects and misleads.
+            argv0 = cmd.split(" ", 1)[0]
+            is_ours = (
+                "python" in argv0                       # not a shell wrapper quoting us
+                and "server.py" in cmd
+                and ("--quant" in cmd or "keyframe-server" in cmd or "/opt/server.py" in cmd)
+            )
+            if is_ours and d.split("/")[-1] != str(os.getpid()):
+                others.append(f"    pid {d.split('/')[-1]}: {cmd.strip()[:70]}")
+    except Exception:
+        pass
+
+    msg = [
+        f"REFUSING TO START: only {available_gb:.1f} GB of host RAM available, "
+        f"and the {quant} path needs roughly {need:.0f} GB.",
+        "",
+        "The transformer is held in host RAM for CPU offload. Starting anyway "
+        "risks an OOM that can take the whole machine down, not just this process.",
+    ]
+    if others:
+        msg += ["", "Another server appears to be running already:"] + others + [
+            "", "Stop it first (or `docker stop keyframe-server`)."]
+    else:
+        msg += ["", "Free memory, or stop whatever else is holding it."]
+    msg += ["", "Override with --allow-low-ram if you are sure."]
+    if force:
+        print("\n".join(msg), flush=True)
+        print("[preflight] --allow-low-ram given; continuing anyway", flush=True)
+        return
+    sys.exit("\n".join(msg))
+
+
 def assert_port_free(host: str, port: int):
     """Fail before loading weights, not after.
 
@@ -389,11 +461,15 @@ if __name__ == "__main__":
     # because model-level offload cannot fit a ~40GB transformer in 23.5GB.
     ap.add_argument("--quant", choices=["nunchaku", "fp8", "none"], default="fp8")
     ap.add_argument("--no-lightning", action="store_true", help="full 40-step sampling instead of 4-step Lightning")
+    ap.add_argument("--allow-low-ram", action="store_true",
+                    help="start even if host RAM looks insufficient (risks an OOM "
+                         "that can take the machine down)")
     ap.add_argument("--nunchaku-variant", default=NUNCHAKU_VARIANT,
                     choices=["ultimate_speed", "balance", "best_quality"],
                     help="INT4 build to load with --quant nunchaku (speed vs quality)")
     args = ap.parse_args()
     NUNCHAKU_VARIANT = args.nunchaku_variant
+    assert_enough_ram(args.quant, args.allow_low_ram)
     assert_port_free(args.host, args.port)
     BIND = (args.host, args.port)
     print(f"[server] loading model (quant={args.quant}) — this takes a few minutes",
