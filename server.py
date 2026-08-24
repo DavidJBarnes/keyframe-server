@@ -319,9 +319,14 @@ def merge_lokr(transformer, path: str, strength: float = 1.0):
 
     sd = load_file(path)
     groups: dict[str, dict[str, torch.Tensor]] = {}
-    for k, v in sd.items():
+    for k in list(sd):
         base, _, leaf = k.rpartition(".")
-        groups.setdefault(base, {})[leaf] = v
+        # pop rather than read: keeps exactly one reference to each tensor, so
+        # freeing a group below actually releases it. Holding the whole adapter
+        # for the duration cost ~8GB of peak on top of a 40GB transformer, which
+        # is enough to trip a container memory cap.
+        groups.setdefault(base, {})[leaf] = sd.pop(k)
+    del sd
 
     # normalised model param name -> (real name, parameter)
     params = {}
@@ -338,7 +343,8 @@ def merge_lokr(transformer, path: str, strength: float = 1.0):
 
     merged = skipped = 0
     with torch.no_grad():
-        for base, parts in groups.items():
+        for i, base in enumerate(list(groups)):
+            parts = groups.pop(base)          # release each group as it is used
             if "lokr_w1" not in parts or "lokr_w2" not in parts:
                 skipped += 1
                 continue
@@ -348,20 +354,34 @@ def merge_lokr(transformer, path: str, strength: float = 1.0):
                 skipped += 1
                 continue
             name, prm = hit
-            w1 = parts["lokr_w1"].to(torch.float32)
-            w2 = parts["lokr_w2"].to(torch.float32)
+            # kron in the parameter's own dtype — float32 doubled the transient
+            # for no benefit at bf16 storage precision.
+            w1 = parts["lokr_w1"].to(prm.dtype)
+            w2 = parts["lokr_w2"].to(prm.dtype)
             delta = torch.kron(w1, w2)
             if tuple(delta.shape) != tuple(prm.shape):
                 skipped += 1
+                del delta, w1, w2
                 continue
             scale = strength
             if "alpha" in parts:
                 scale *= float(parts["alpha"].item()) / w1.shape[0]
-            prm.add_(delta.to(prm.dtype).to(prm.device) * scale)
+            prm.add_(delta.to(prm.device), alpha=scale)   # no extra scaled copy
             merged += 1
+            del delta, w1, w2, parts
+            if i % 100 == 0:
+                gc.collect()
 
+    del groups
+    gc.collect()
+    try:
+        with open("/proc/self/status") as f:
+            rss = next(int(l.split()[1]) for l in f if l.startswith("VmRSS"))
+        mem = f", rss {rss / 1024 / 1024:.1f} GB"
+    except Exception:
+        mem = ""
     print(f"[lokr] merged {merged} modules (skipped {skipped}) "
-          f"from {path} at strength {strength}", flush=True)
+          f"from {path} at strength {strength}{mem}", flush=True)
     if merged == 0:
         print("[lokr] WARNING: nothing merged — names did not match the model", flush=True)
     return merged
