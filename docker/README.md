@@ -3,7 +3,17 @@
 Qwen-Image-Edit-2511 behind an authenticated HTTP endpoint, mirroring the fal
 request/response shape so `client/client.py` can target it unchanged.
 
-**Docker Hub:** `davidjbarnes/keyframe-server`
+**Docker Hub:** `davidjbarnes/keyframe-server` — built and pushed automatically by
+`.github/workflows/docker-publish.yml` on any push to `main` that touches `server.py`
+or `docker/`. Don't build and push by hand: a local push takes ~70 minutes on a home
+uplink, which is exactly how the published image drifts out of sync with the repo.
+
+Requires repo secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`. **Rotating the Docker
+Hub PAT means updating that secret**, or CI starts failing:
+
+```bash
+gh secret set DOCKERHUB_TOKEN -R DavidJBarnes/keyframe-server -b "<new-pat>"
+```
 
 ## How it works
 
