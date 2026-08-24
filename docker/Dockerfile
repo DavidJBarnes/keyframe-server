@@ -36,10 +36,12 @@ ENV HF_HOME=/workspace/hf \
     QUANT=fp8 \
     SERVER_PORT=8189 \
     PROXY_PORT=8888 \
-    API_KEY="" \
     LIGHTNING=1 \
     SKIP_DOWNLOAD=0
 
+# API_KEY is intentionally NOT declared here — it is a runtime secret,
+# supplied by the RunPod template. auth-proxy.py defaults it to empty
+# and warns loudly when unset.
 COPY server.py /opt/server.py
 COPY docker/provision.sh /opt/provision.sh
 COPY docker/auth-proxy.py /opt/auth-proxy.py
