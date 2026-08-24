@@ -25,6 +25,7 @@ ComfyUI), 4-step Lightning, and expandable_segments to limit fragmentation.
 """
 import argparse
 import base64
+import contextlib
 import io
 import os
 import re
@@ -51,6 +52,7 @@ MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 # svdq-{precision}_r128-* scheme the official repos use.
 #   precision: int4 for pre-Blackwell (3090 = sm_86), fp4 for RTX 50-series
 #   variant:   ultimate_speed (11.5GB) | balance (12.7GB) | best_quality (14.2GB)
+QUANT_MODE = "fp8"  # resolved at startup; shown in the ready banner
 NUNCHAKU_REPO = "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511"
 NUNCHAKU_VARIANT = "balance"
 
@@ -63,10 +65,30 @@ LIGHTNING_LORA = (
     "Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
 )
 
-app = FastAPI(title="qwen-edit-local")
 PIPE = None
 STEPS = 4
 CFG = 1.0
+BIND = ("0.0.0.0", 8189)  # filled in from argv; used only for the ready banner
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Fires once uvicorn is actually serving. load_pipeline() finishing is NOT
+    # the same thing — the port is not listening until after it returns, so a
+    # "ready" printed there is a lie you can act on too early.
+    host, port = BIND
+    shown = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
+    print("\n" + "=" * 62, flush=True)
+    print("  READY — accepting requests", flush=True)
+    print(f"    POST   http://{shown}:{port}/edit", flush=True)
+    print(f"    GET    http://{shown}:{port}/health", flush=True)
+    print(f"    quant={QUANT_MODE}  steps={STEPS}  cfg={CFG}", flush=True)
+    print("=" * 62 + "\n", flush=True)
+    yield
+    print("\n[server] shutting down", flush=True)
+
+
+app = FastAPI(title="qwen-edit-local", lifespan=lifespan)
 
 
 class EditRequest(BaseModel):
@@ -154,7 +176,8 @@ def assert_port_free(host: str, port: int):
 
 
 def load_pipeline(quant: str, lightning: bool):
-    global PIPE, STEPS, CFG
+    global PIPE, STEPS, CFG, QUANT_MODE
+    QUANT_MODE = quant
     from diffusers import QwenImageEditPipeline
 
     if quant == "nunchaku":
@@ -219,7 +242,8 @@ def load_pipeline(quant: str, lightning: bool):
     else:
         STEPS, CFG = 40, 4.0
 
-    print(f"[pipeline] ready: quant={quant} steps={STEPS} cfg={CFG}")
+    print(f"[pipeline] loaded: quant={quant} steps={STEPS} cfg={CFG} "
+          f"(not serving yet — waiting for the port)", flush=True)
 
     PIPE = pipe
 
@@ -240,5 +264,8 @@ if __name__ == "__main__":
     args = ap.parse_args()
     NUNCHAKU_VARIANT = args.nunchaku_variant
     assert_port_free(args.host, args.port)
+    BIND = (args.host, args.port)
+    print(f"[server] loading model (quant={args.quant}) — this takes a few minutes",
+          flush=True)
     load_pipeline(args.quant, not args.no_lightning)
     uvicorn.run(app, host=args.host, port=args.port)
