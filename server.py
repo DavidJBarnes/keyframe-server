@@ -213,7 +213,14 @@ def assert_port_free(host: str, port: int):
 def load_pipeline(quant: str, lightning: bool):
     global PIPE, STEPS, CFG, QUANT_MODE
     QUANT_MODE = quant
-    from diffusers import QwenImageEditPipeline
+    # Qwen-Image-Edit-2511's own model_index.json declares
+    #     _class_name: QwenImageEditPlusPipeline
+    # Loading the plain QwenImageEditPipeline instead "works" — weights load, edits
+    # come out — but the Plus pipeline preprocesses the condition image differently
+    # (separate 384x384 VL-encoder path, condition_image_sizes, VAE_IMAGE handling).
+    # Using the wrong class degrades edit fidelity: identity and hair drift, and
+    # structural edits get skipped in favour of a recolour.
+    from diffusers import QwenImageEditPlusPipeline
 
     if quant == "nunchaku":
         from nunchaku import NunchakuQwenImageTransformer2DModel
@@ -225,7 +232,7 @@ def load_pipeline(quant: str, lightning: bool):
         )
         print(f"[nunchaku] loading {weights}")
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(weights)
-        pipe = QwenImageEditPipeline.from_pretrained(
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
         )
         pipe.enable_model_cpu_offload()
@@ -237,12 +244,12 @@ def load_pipeline(quant: str, lightning: bool):
             MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16
         )
         quantize_(transformer, Float8WeightOnlyConfig())
-        pipe = QwenImageEditPipeline.from_pretrained(
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
         )
         pipe.enable_model_cpu_offload()
     else:
-        pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+        pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
         pipe.enable_model_cpu_offload()
 
     if lightning:
