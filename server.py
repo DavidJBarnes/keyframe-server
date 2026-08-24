@@ -431,7 +431,6 @@ def load_pipeline(quant: str, lightning: bool, lora: tuple[str, float] | None = 
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
         )
-        pipe.enable_model_cpu_offload()
     elif quant == "fp8":
         from diffusers import QwenImageTransformer2DModel
         from torchao.quantization import quantize_, Float8WeightOnlyConfig
@@ -448,10 +447,8 @@ def load_pipeline(quant: str, lightning: bool, lora: tuple[str, float] | None = 
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
         )
-        pipe.enable_model_cpu_offload()
     else:
         pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
-        pipe.enable_model_cpu_offload()
 
     if lora:
         path, strength = lora
@@ -503,6 +500,13 @@ def load_pipeline(quant: str, lightning: bool, lora: tuple[str, float] | None = 
             STEPS, CFG = 40, 4.0
     else:
         STEPS, CFG = 40, 4.0
+
+    # Offload LAST, after every adapter is attached. accelerate installs its
+    # hooks on the modules that exist at the time of the call; adapters added
+    # afterwards are never hooked, so the whole model stays resident on the GPU
+    # and leaves no room for activations. Symptom: 23GB held between requests
+    # and every edit OOMs, while the same server without a LoRA sits at 256MB.
+    pipe.enable_model_cpu_offload()
 
     print(f"[pipeline] loaded: quant={quant} steps={STEPS} cfg={CFG} "
           f"(not serving yet — waiting for the port)", flush=True)
