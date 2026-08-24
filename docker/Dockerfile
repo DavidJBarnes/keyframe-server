@@ -37,6 +37,8 @@ RUN pip install --no-cache-dir \
         "huggingface_hub[cli]" "hf_xet"
 
 # Model cache lives on the network volume, not in the container.
+# LORA is read by start.sh and passed through as --lora. Mount the directory:
+#   -v ~/models/qwen:/workspace/loras -e LORA=/workspace/loras/x.safetensors
 ENV HF_HOME=/workspace/hf \
     QUANT=fp8 \
     SERVER_PORT=8189 \

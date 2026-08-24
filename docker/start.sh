@@ -18,6 +18,16 @@ python3 /opt/auth-proxy.py &
 LIGHT_FLAG=""
 [ "${LIGHTNING:-1}" = "0" ] && LIGHT_FLAG="--no-lightning"
 
+LORA_FLAG=""
+if [ -n "${LORA:-}" ]; then
+    if [ -f "$LORA" ]; then
+        LORA_FLAG="--lora $LORA ${LORA_WEIGHT:-1.0}"
+        echo "--- adapter: $LORA at ${LORA_WEIGHT:-1.0} ---"
+    else
+        echo "WARNING: LORA=$LORA not found in the container — is the directory mounted?"
+    fi
+fi
+
 echo "--- starting edit server (quant=${QUANT:-fp8}) on 127.0.0.1:${SERVER_PORT:-8189} ---"
 # Bind the model server to loopback only: the auth proxy is the sole public door.
 # expandable_segments cuts fragmentation, which matters because fp8 leaves only a
@@ -27,4 +37,4 @@ exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         --quant "${QUANT:-fp8}" \
         --port "${SERVER_PORT:-8189}" \
         --host 127.0.0.1 \
-        $LIGHT_FLAG
+        $LIGHT_FLAG $LORA_FLAG

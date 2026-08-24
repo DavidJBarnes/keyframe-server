@@ -367,7 +367,26 @@ def merge_lokr(transformer, path: str, strength: float = 1.0):
     return merged
 
 
-def load_pipeline(quant: str, lightning: bool):
+def adapter_format(path: str) -> str:
+    """Peek at the safetensors header to tell LoKr from a standard LoRA."""
+    import json as _json
+    import struct as _struct
+
+    with open(path, "rb") as f:
+        n = _struct.unpack("<Q", f.read(8))[0]
+        header = _json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    keys = list(header)
+    if any("lokr_w" in k for k in keys):
+        return "lokr"
+    if any("hada_w" in k for k in keys):
+        return "loha"
+    if any(("lora_down" in k or "lora_A" in k) for k in keys):
+        return "lora"
+    return "unknown"
+
+
+def load_pipeline(quant: str, lightning: bool, lora: tuple[str, float] | None = None):
     global PIPE, STEPS, CFG, QUANT_MODE
     QUANT_MODE = quant
     # Qwen-Image-Edit-2511's own model_index.json declares
@@ -400,10 +419,11 @@ def load_pipeline(quant: str, lightning: bool):
         transformer = QwenImageTransformer2DModel.from_pretrained(
             MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16
         )
-        # Merge before quantising — see merge_lokr's docstring.
-        lokr = os.environ.get("LOKR_PATH")
-        if lokr:
-            merge_lokr(transformer, lokr, float(os.environ.get("LOKR_WEIGHT", "1.0")))
+        # A LoKr must be merged into bf16 weights BEFORE quantising — torchao
+        # replaces them with tensor subclasses a bf16 delta cannot be added to.
+        # A standard LoRA is attached to the built pipeline instead, further down.
+        if lora and adapter_format(lora[0]) == "lokr":
+            merge_lokr(transformer, lora[0], lora[1])
         quantize_(transformer, Float8WeightOnlyConfig())
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16
@@ -412,6 +432,25 @@ def load_pipeline(quant: str, lightning: bool):
     else:
         pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
         pipe.enable_model_cpu_offload()
+
+    if lora:
+        path, strength = lora
+        fmt = adapter_format(path)
+        if fmt == "lokr":
+            if quant != "fp8":
+                print(f"[lora] LoKr merging is only wired into the fp8 path; "
+                      f"quant={quant} ignored it", flush=True)
+        elif fmt == "lora":
+            try:
+                pipe.load_lora_weights(path, adapter_name="user")
+                pipe.set_adapters(["user"], adapter_weights=[strength])
+                print(f"[lora] attached {path} at {strength}", flush=True)
+            except Exception as e:
+                print(f"[lora] FAILED to attach ({type(e).__name__}: {e})", flush=True)
+        else:
+            print(f"[lora] UNSUPPORTED format '{fmt}' for {path} — "
+                  f"diffusers handles LoRA and this server adds LoKr; "
+                  f"LoHa is not supported. Continuing without it.", flush=True)
 
     if lightning:
         repo, weight = LIGHTNING_LORA
@@ -461,6 +500,11 @@ if __name__ == "__main__":
     # because model-level offload cannot fit a ~40GB transformer in 23.5GB.
     ap.add_argument("--quant", choices=["nunchaku", "fp8", "none"], default="fp8")
     ap.add_argument("--no-lightning", action="store_true", help="full 40-step sampling instead of 4-step Lightning")
+    ap.add_argument("--lora", nargs="+", metavar=("PATH", "WEIGHT"), default=None,
+                    help="adapter to apply at startup: --lora /path/to.safetensors [0.8]. "
+                         "Server-side path. LoRA is attached at runtime; LoKr is merged "
+                         "into the weights (fp8 path only) and so needs a restart to change. "
+                         "Check compatibility first with tools/check_lora.py")
     ap.add_argument("--allow-low-ram", action="store_true",
                     help="start even if host RAM looks insufficient (risks an OOM "
                          "that can take the machine down)")
@@ -469,10 +513,25 @@ if __name__ == "__main__":
                     help="INT4 build to load with --quant nunchaku (speed vs quality)")
     args = ap.parse_args()
     NUNCHAKU_VARIANT = args.nunchaku_variant
+    lora = None
+    if args.lora:
+        if len(args.lora) > 2:
+            ap.error("--lora takes a path and an optional weight")
+        lora_path = os.path.expanduser(args.lora[0])
+        if not os.path.exists(lora_path):
+            sys.exit(f"--lora: no such file on the server: {lora_path}")
+        try:
+            lora_weight = float(args.lora[1]) if len(args.lora) == 2 else 1.0
+        except ValueError:
+            ap.error(f"--lora weight must be a number, got {args.lora[1]!r}")
+        lora = (lora_path, lora_weight)
+    elif os.environ.get("LOKR_PATH"):          # back-compat with the env form
+        lora = (os.environ["LOKR_PATH"], float(os.environ.get("LOKR_WEIGHT", "1.0")))
+
     assert_enough_ram(args.quant, args.allow_low_ram)
     assert_port_free(args.host, args.port)
     BIND = (args.host, args.port)
     print(f"[server] loading model (quant={args.quant}) — this takes a few minutes",
           flush=True)
-    load_pipeline(args.quant, not args.no_lightning)
+    load_pipeline(args.quant, not args.no_lightning, lora)
     uvicorn.run(app, host=args.host, port=args.port)
