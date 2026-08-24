@@ -26,6 +26,7 @@ ComfyUI), 4-step Lightning, and expandable_segments to limit fragmentation.
 import argparse
 import base64
 import contextlib
+import gc
 import io
 import os
 import re
@@ -147,7 +148,7 @@ def edit(req: EditRequest):
         num_images_per_prompt=req.num_images,
         generator=gen,
     )
-    return {
+    payload = {
         "images": [
             {
                 "url": encode_image(im),
@@ -159,11 +160,31 @@ def edit(req: EditRequest):
         "description": "",
     }
 
+    # Release cached blocks between requests. With model CPU offload the weights
+    # move off the GPU, but PyTorch's caching allocator keeps the freed blocks,
+    # and varying image sizes fragment them. Left alone the process creeps from
+    # ~11GB free to nothing over a session and then every request 500s on OOM —
+    # which reads like an unrelated failure hours after the real cause.
+    del out
+    gc.collect()
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    print(f"[edit] done — vram free {free / 1e9:.1f} / {total / 1e9:.1f} GB", flush=True)
+
+    return payload
+
 
 @app.get("/health")
 def health():
     free, total = torch.cuda.mem_get_info()
-    return {"status": "ok", "vram_free_gb": round(free / 1e9, 2), "vram_total_gb": round(total / 1e9, 2)}
+    return {
+        "status": "ok",
+        "vram_free_gb": round(free / 1e9, 2),
+        "vram_total_gb": round(total / 1e9, 2),
+        # Below roughly 2GB free the next edit is likely to OOM. Surfaced so a
+        # monitor can catch the creep rather than discovering it as a 500.
+        "vram_low": free / 1e9 < 2.0,
+    }
 
 
 def assert_port_free(host: str, port: int):
