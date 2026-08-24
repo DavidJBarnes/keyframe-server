@@ -191,6 +191,11 @@ def main():
                     help="sampling steps (local only). Default: let the server decide — "
                          "4 when its Lightning LoRA is active, 40 when it is not. Only "
                          "override when you know which the server resolved.")
+    ap.add_argument("--negative", default=None, metavar="TEXT",
+                    help="negative prompt (local only). Guidance needs one: cfg>1 with no "
+                         "negative prompt silently disables CFG, so the server supplies a "
+                         "blank one automatically. Set this to steer away from something "
+                         "specific.")
     ap.add_argument("--cfg", type=float, default=None, metavar="F",
                     help="true_cfg_scale (local only). Default: server's value, which "
                          "pairs with its step count (1.0 for 4-step, 4.0 for 40-step)")
@@ -236,12 +241,14 @@ def main():
             payload["num_inference_steps"] = args.steps
         if args.cfg is not None:
             payload["true_cfg_scale"] = args.cfg
+        if args.negative is not None:
+            payload["negative_prompt"] = args.negative
         result = run_local(server, payload, args.api_key)
     else:
         # fal endpoints reject unknown keys, and pick their own sampler settings.
         for flag, val in (("--steps", args.steps), ("--cfg", args.cfg),
                           ("--seed", args.seed), ("--server", args.server),
-                          ("--api-key", args.api_key)):
+                          ("--api-key", args.api_key), ("--negative", args.negative)):
             if val is not None:
                 print(f"warning: {flag} is ignored by --model {args.model} (local backends only)",
                       file=sys.stderr)

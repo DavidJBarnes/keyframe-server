@@ -98,6 +98,7 @@ class EditRequest(BaseModel):
     seed: int | None = None
     num_inference_steps: int | None = None
     true_cfg_scale: float | None = None
+    negative_prompt: str | None = None
 
 
 def decode_image(src: str) -> Image.Image:
@@ -125,11 +126,24 @@ def edit(req: EditRequest):
     gen = None
     if req.seed is not None:
         gen = torch.Generator(device="cuda").manual_seed(req.seed)
+    cfg = req.true_cfg_scale or CFG
+    negative = req.negative_prompt
+
+    # diffusers gates guidance on BOTH knobs:
+    #     do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+    # so asking for cfg > 1 without a negative prompt silently disables guidance
+    # entirely — the request looks honoured and adherence is quietly poor. Supply
+    # a blank negative prompt so the knob does what the caller asked. diffusers'
+    # own docs note that even " " is enough to switch CFG on.
+    if cfg > 1 and not negative:
+        negative = " "
+
     out = PIPE(
         image=images if len(images) > 1 else images[0],
         prompt=req.prompt,
+        negative_prompt=negative,
         num_inference_steps=req.num_inference_steps or STEPS,
-        true_cfg_scale=req.true_cfg_scale or CFG,
+        true_cfg_scale=cfg,
         num_images_per_prompt=req.num_images,
         generator=gen,
     )
