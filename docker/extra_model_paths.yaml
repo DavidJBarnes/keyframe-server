@@ -1,0 +1,9 @@
+# Point ComfyUI at the bind-mounted host model tree. Mounted read-only, so
+# ComfyUI must never be asked to write here.
+keyframe:
+    base_path: /workspace/models
+    checkpoints: qwen/v23/
+    loras: qwen/
+    vae: vae/
+    clip: clip/
+    text_encoders: text_encoders/
