@@ -417,8 +417,15 @@ def build_workflow(req: GenerateRequest, filenames: list[str], w: int, h: int) -
     return wf
 
 
-def run_workflow(wf: dict, timeout_s: int = 900) -> list[dict]:
-    """Submit, poll to completion, return the SaveImage output descriptors."""
+def run_workflow(wf: dict, timeout_s: int = 900, save_node: str = "6") -> list[dict]:
+    """Submit, poll to completion, return the SaveImage output descriptors.
+
+    Only `save_node`'s images count. Collecting from every output node breaks
+    face mode: ExpressionEditor is itself an OUTPUT_NODE and emits a temp
+    preview of the *face crop* (nodes.py:955) alongside the real full-frame
+    result, so an unfiltered sweep can return a 512x512 crop where the caller
+    asked for a 512x768 keyframe.
+    """
     r = requests.post(f"{COMFY}/prompt", json={"prompt": wf}, timeout=60)
     if r.status_code != 200:
         # ComfyUI reports graph validation errors here; surfacing the body makes
@@ -433,10 +440,18 @@ def run_workflow(wf: dict, timeout_s: int = 900) -> list[dict]:
             status = entry.get("status", {})
             if status.get("status_str") == "error" or status.get("completed") is False:
                 raise HTTPException(502, f"ComfyUI execution failed: {json.dumps(status)[:600]}")
-            outs = [img for node in entry.get("outputs", {}).values()
-                    for img in node.get("images", [])]
+            nodes = entry.get("outputs", {})
+            outs = [img for img in nodes.get(save_node, {}).get("images", [])
+                    if img.get("type") != "temp"]
             if outs:
                 return outs
+            # The graph finished but the save node produced nothing: report that
+            # rather than silently falling back to another node's preview.
+            if nodes and entry.get("status", {}).get("completed"):
+                raise HTTPException(
+                    502,
+                    f"ComfyUI finished but node {save_node} emitted no image "
+                    f"(nodes with output: {sorted(nodes)})")
         time.sleep(1.0)
     raise HTTPException(504, f"ComfyUI did not finish within {timeout_s}s")
 
