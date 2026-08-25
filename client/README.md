@@ -77,7 +77,7 @@ Measured on 3090.zero (`--quant fp8`, 1103x1426 input): **44 s** at the 4-step d
 | `--seed` | none | Honored by local backends only |
 | `--steps` | server's | Sampling steps, local only. Server decides by default |
 | `--cfg` | server's | `true_cfg_scale`, local only. Server decides by default |
-| `--size` | none | Resize-to-cover + center-crop to `WxH`, /32 enforced |
+| `--size` | none | **Generate at** `WxH` (local backends), then resize-to-cover + centre-crop. /32 enforced |
 | `--quiet` | off | Suppress fal queue logs |
 
 **Local backends:**
@@ -95,6 +95,19 @@ port 80 on the GPU box, so the port is not optional. For RunPod the URL looks li
 
 Local images are inlined as base64 data URIs — no fal storage upload, no CDN auth. Errors
 are scrubbed so base64 payloads never flood the terminal.
+
+**`--size` matters for speed, not just dimensions.** Compute scales with *output*
+resolution — measured on the ComfyUI backend at 4 steps:
+
+| output | time |
+|---|---|
+| 0.39 MP (512x768) | ~6 s |
+| 1.55 MP (1088x1424) | ~21 s |
+| 7.09 MP (2368x2992) | ~186 s |
+
+A phone photo passed in raw is ~7 MP. `--size` is sent to the server so it *generates*
+at that size; without it the server caps itself at 1.2 MP (`MAX_MP`) and preserves
+aspect ratio.
 
 ---
 

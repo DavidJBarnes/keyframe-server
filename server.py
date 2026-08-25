@@ -46,6 +46,9 @@ SAMPLER = os.environ.get("SAMPLER", "euler_ancestral")
 SCHEDULER = os.environ.get("SCHEDULER", "beta")
 STEPS = int(os.environ.get("STEPS", "4"))
 CFG = float(os.environ.get("CFG", "1.0"))
+# Ceiling for the auto-chosen output size. Only applies when the caller does not
+# specify width/height.
+MAX_MP = float(os.environ.get("MAX_MP", "1.2"))
 BIND = ("0.0.0.0", 8189)
 
 
@@ -182,9 +185,20 @@ def fetch_output(desc: dict) -> bytes:
 def edit(req: EditRequest):
     images = [decode_image(u) for u in req.image_urls]
 
-    # Latent size defaults to the first input, snapped to /16 as the VAE requires.
-    w = req.width or images[0].width
-    h = req.height or images[0].height
+    # Latent defaults to the first input's size, but capped: compute scales with
+    # output pixels (0.39MP ~6s, 1.55MP ~21s, 7.09MP ~186s), and a phone photo
+    # fed in raw is ~7MP. Aspect ratio is preserved; explicit width/height wins.
+    if req.width and req.height:
+        w, h = req.width, req.height
+    else:
+        w, h = images[0].width, images[0].height
+        mp = (w * h) / 1e6
+        if mp > MAX_MP:
+            scale = (MAX_MP / mp) ** 0.5
+            w, h = int(w * scale), int(h * scale)
+            print(f"[edit] input {images[0].width}x{images[0].height} ({mp:.2f}MP) "
+                  f"capped to {w}x{h} ({MAX_MP}MP). Pass width/height to override.",
+                  flush=True)
     w, h = max(16, (w // 16) * 16), max(16, (h // 16) * 16)
 
     filenames = [comfy_upload(im) for im in images]

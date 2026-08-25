@@ -243,6 +243,11 @@ def main():
             payload["true_cfg_scale"] = args.cfg
         if args.negative is not None:
             payload["negative_prompt"] = args.negative
+        if args.size:
+            # Generate at this size rather than only shrinking the result. Output
+            # resolution drives compute directly: 0.39MP takes ~6s and 7MP takes
+            # ~186s, so resizing after the fact wasted almost all of it.
+            payload["width"], payload["height"] = args.size
         result = run_local(server, payload, args.api_key)
     else:
         # fal endpoints reject unknown keys, and pick their own sampler settings.
