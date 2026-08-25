@@ -96,6 +96,20 @@ port 80 on the GPU box, so the port is not optional. For RunPod the URL looks li
 Local images are inlined as base64 data URIs — no fal storage upload, no CDN auth. Errors
 are scrubbed so base64 payloads never flood the terminal.
 
+**Do not use `--size` to change aspect ratio.** Generating a latent at a different
+aspect than the condition image makes the model *recompose* rather than edit in place —
+it regenerates the subject to fit the new frame, and **faces come back visibly
+different**. Measured on a 2383x2998 (4:5) source asking for 512x768 (2:3): identity
+was lost. The same edit at the source's native aspect preserved it exactly.
+
+`--size` now crops the condition image to match, which removes the distortion, but
+cropping 4:5 to 2:3 still discards 16% of the width and tightens the framing.
+
+**Crop to your target framing once, then edit at native aspect.** For LTX keyframes
+that means cutting the source to 512x768 first (see `crop.sh`), then every edit runs
+native and identity holds. Choosing the framing is a decision to make deliberately, not
+a side effect of a size flag.
+
 **`--size` matters for speed, not just dimensions.** Compute scales with *output*
 resolution — measured on the ComfyUI backend at 4 steps:
 

@@ -88,6 +88,14 @@ def to_data_uri(path: Path) -> str:
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
 
 
+def to_data_uri_resized(path: Path, size) -> str:
+    """Inline a local image, first cropped to `size`'s aspect ratio."""
+    im = normalize(path.read_bytes(), size)
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 def scrub(obj):
     """Truncate long strings (data URIs, base64) so error output stays readable."""
     if isinstance(obj, str):
@@ -217,7 +225,17 @@ def main():
             path = Path(src)
             if not path.exists():
                 sys.exit(f"input not found: {src}")
-            image_urls.append(to_data_uri(path))
+            if args.size:
+                # Match the condition image to the requested aspect BEFORE sending.
+                # Generating a 2:3 latent from a 4:5 condition makes the model
+                # recompose to fit the new frame rather than edit in place, and it
+                # regenerates the subject while doing so — faces come back visibly
+                # different. Cropping here keeps latent and condition in agreement.
+                # It also cuts encode cost, since the condition is no longer a
+                # multi-megapixel original.
+                image_urls.append(to_data_uri_resized(path, args.size))
+            else:
+                image_urls.append(to_data_uri(path))
 
     payload = {
         "prompt": args.prompt,
