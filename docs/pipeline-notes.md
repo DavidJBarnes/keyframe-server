@@ -430,6 +430,41 @@ which disables `merge()`/`unmerge()`; forward works, merging does not.
 
 ---
 
+## 7e. Chained edits: the decay curve (2026-08-25)
+
+Section 1 says "never chain edits, one source N branches" — written from the wolf
+shot's qualitative failure. Here is the measurement.
+
+Five sequential edits, each output feeding the next input, from a 512x768 portrait.
+Identity is ArcFace cosine against step 0:
+
+| step | full: identity / drift | face: identity / drift |
+|---|---|---|
+| 1 | 0.850 / 25.98 | 0.863 / **4.09** |
+| 2 | 0.723 / 31.21 | 0.705 / 11.26 |
+| 3 | 0.417 / 33.26 | 0.303 / 11.63 |
+| 4 | 0.240 / 35.60 | 0.176 / 11.95 |
+| 5 | **0.120** / 38.38 | **0.141** / 13.05 |
+
+**The practical limit is about two steps.** 0.85 is fine, 0.72 is borderline, 0.42 is a
+different person. By step 5 both modes land at 0.12-0.14.
+
+**mode=face does NOT prevent identity decay.** It contains *pixel* drift to a third of
+full mode's, because background, clothing and hair edges are frozen — but it confines all
+the remaining error to the face box, which is exactly where identity lives. At steps 3-4
+it is marginally worse than full mode.
+
+**Consequence for any sequence builder:** feeding each result in as the next input loses
+the subject within three steps, in either mode. Every frame must be **one edit from the
+anchor**, with the previous frame passed as a *second* reference for continuity rather
+than as the base. Multi-reference is the mechanism (verified: "the woman from image 1
+holding the mug from image 2" composes correctly).
+
+Reproduce with `client/chain/` and the ArcFace scorer; note insightface must run on CPU
+(`ctx_id=-1`) while the ComfyUI container holds the GPU.
+
+---
+
 ## 8. Open items for productionalising
 
 - The edit server now runs on 3090.zero:8189 (`--quant fp8`, 4-step Lightning) — see
