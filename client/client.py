@@ -199,6 +199,10 @@ def main():
                     help="sampling steps (local only). Default: let the server decide — "
                          "4 when its Lightning LoRA is active, 40 when it is not. Only "
                          "override when you know which the server resolved.")
+    ap.add_argument("--denoise", type=float, default=None, metavar="F",
+                    help="0<F<=1 (local only). Below 1.0 sampling starts from the source "
+                         "image instead of noise, so only part of it is redrawn: ~0.2-0.4 "
+                         "for small adjustments, 1.0 (default) for a full edit.")
     ap.add_argument("--negative", default=None, metavar="TEXT",
                     help="negative prompt (local only). Guidance needs one: cfg>1 with no "
                          "negative prompt silently disables CFG, so the server supplies a "
@@ -212,6 +216,8 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="suppress queue logs")
     args = ap.parse_args()
 
+    if args.denoise is not None and not (0.0 < args.denoise <= 1.0):
+        sys.exit(f"--denoise must be in (0, 1], got {args.denoise}")
     if args.steps is not None and args.steps < 1:
         sys.exit(f"--steps must be >= 1, got {args.steps}")
     if args.cfg is not None and args.cfg <= 0:
@@ -261,6 +267,8 @@ def main():
             payload["true_cfg_scale"] = args.cfg
         if args.negative is not None:
             payload["negative_prompt"] = args.negative
+        if args.denoise is not None:
+            payload["denoise"] = args.denoise
         if args.size:
             # Generate at this size rather than only shrinking the result. Output
             # resolution drives compute directly: 0.39MP takes ~6s and 7MP takes

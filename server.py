@@ -78,6 +78,11 @@ class EditRequest(BaseModel):
     num_inference_steps: int | None = None
     true_cfg_scale: float | None = None
     negative_prompt: str | None = None
+    # <1.0 starts sampling from the source image's latent instead of noise, so
+    # only part of the original is redrawn. 0.2-0.4 gives small adjustments;
+    # 1.0 (default) is a full regeneration conditioned on the reference images,
+    # which is how Qwen edit models normally run.
+    denoise: float | None = Field(default=None, gt=0.0, le=1.0)
     # Absent, output matches the first input image. The diffusers path chose its
     # own ~1MP size and returned 832x1248 for a 512x768 input, which forced a
     # resize on every keyframe; here the latent is ours to set.
@@ -120,6 +125,7 @@ def build_workflow(req: EditRequest, filenames: list[str], w: int, h: int) -> di
     steps = req.num_inference_steps or STEPS
     cfg = req.true_cfg_scale if req.true_cfg_scale is not None else CFG
     seed = req.seed if req.seed is not None else int.from_bytes(os.urandom(4), "big")
+    denoise = req.denoise if req.denoise is not None else 1.0
 
     wf: dict = {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT}},
@@ -134,7 +140,7 @@ def build_workflow(req: EditRequest, filenames: list[str], w: int, h: int) -> di
               "inputs": {"model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0],
                          "latent_image": ["9", 0], "seed": seed, "steps": steps,
                          "cfg": cfg, "sampler_name": SAMPLER,
-                         "scheduler": SCHEDULER, "denoise": 1.0}},
+                         "scheduler": SCHEDULER, "denoise": denoise}},
         "5": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0], "vae": ["1", 2]}},
         "6": {"class_type": "SaveImage",
               "inputs": {"images": ["5", 0], "filename_prefix": "keyframe"}},
@@ -144,6 +150,16 @@ def build_workflow(req: EditRequest, filenames: list[str], w: int, h: int) -> di
         node = str(100 + i)
         wf[node] = {"class_type": "LoadImage", "inputs": {"image": fn, "upload": "image"}}
         wf["3"]["inputs"][f"image{i}"] = [node, 0]
+
+    if denoise < 1.0:
+        # Seed the sampler with the source image rather than noise. Requires the
+        # first condition image to already match the output size — the encoder
+        # emits a latent at the image's own dimensions, and KSampler cannot mix
+        # that with a differently shaped one.
+        wf["110"] = {"class_type": "VAEEncode",
+                     "inputs": {"pixels": ["101", 0], "vae": ["1", 2]}}
+        wf["2"]["inputs"]["latent_image"] = ["110", 0]
+        wf.pop("9", None)
     return wf
 
 
@@ -183,7 +199,10 @@ def fetch_output(desc: dict) -> bytes:
 
 @app.post("/edit")
 def edit(req: EditRequest):
+    t0 = time.time()
+    rid = uuid.uuid4().hex[:8]
     images = [decode_image(u) for u in req.image_urls]
+    t_decode = time.time() - t0
 
     # Latent defaults to the first input's size, but capped: compute scales with
     # output pixels (0.39MP ~6s, 1.55MP ~21s, 7.09MP ~186s), and a phone photo
@@ -201,10 +220,31 @@ def edit(req: EditRequest):
                   flush=True)
     w, h = max(16, (w // 16) * 16), max(16, (h // 16) * 16)
 
-    filenames = [comfy_upload(im) for im in images]
-    outs = run_workflow(build_workflow(req, filenames, w, h))
+    if req.denoise is not None and req.denoise < 1.0 and (images[0].width, images[0].height) != (w, h):
+        # VAEEncode produces a latent sized to the image it is given, so the
+        # source must already be the output size or the sampler shapes disagree.
+        images[0] = images[0].resize((w, h), Image.LANCZOS)
+        print(f"[edit] denoise<1: resized source to {w}x{h} to match the latent", flush=True)
 
-    return {
+    srcs = " ".join(f"{im.width}x{im.height}" for im in images)
+    print(f"[{rid}] in {len(images)} img ({srcs}) -> out {w}x{h} | "
+          f"steps={req.num_inference_steps or STEPS} "
+          f"cfg={req.true_cfg_scale if req.true_cfg_scale is not None else CFG} "
+          f"denoise={req.denoise if req.denoise is not None else 1.0} "
+          f"seed={req.seed if req.seed is not None else 'random'}", flush=True)
+    print(f'[{rid}] prompt: {req.prompt[:110]}{"..." if len(req.prompt) > 110 else ""}',
+          flush=True)
+
+    t1 = time.time()
+    filenames = [comfy_upload(im) for im in images]
+    t_upload = time.time() - t1
+
+    t2 = time.time()
+    outs = run_workflow(build_workflow(req, filenames, w, h))
+    t_run = time.time() - t2
+
+    t3 = time.time()
+    payload = {
         "images": [
             {
                 "url": encode_image(Image.open(io.BytesIO(fetch_output(o))).convert("RGB")),
@@ -215,16 +255,31 @@ def edit(req: EditRequest):
         ],
         "description": "",
     }
+    t_fetch = time.time() - t3
+
+    try:
+        free, total = _vram()
+        vram = f" | vram {free:.1f}/{total:.1f} GB free"
+    except Exception:
+        vram = ""
+    print(f"[{rid}] done in {time.time() - t0:.1f}s "
+          f"(decode {t_decode:.1f} upload {t_upload:.1f} "
+          f"generate {t_run:.1f} fetch {t_fetch:.1f}) "
+          f"-> {len(outs)} image(s){vram}", flush=True)
+    return payload
+
+
+def _vram() -> tuple[float, float]:
+    r = requests.get(f"{COMFY}/system_stats", timeout=5)
+    r.raise_for_status()
+    dev = (r.json().get("devices") or [{}])[0]
+    return dev.get("vram_free", 0) / 1e9, dev.get("vram_total", 0) / 1e9
 
 
 @app.get("/health")
 def health():
     try:
-        r = requests.get(f"{COMFY}/system_stats", timeout=5)
-        r.raise_for_status()
-        dev = (r.json().get("devices") or [{}])[0]
-        free = dev.get("vram_free", 0) / 1e9
-        total = dev.get("vram_total", 0) / 1e9
+        free, total = _vram()
         return {"status": "ok", "backend": "comfyui", "ckpt": CKPT,
                 "vram_free_gb": round(free, 2), "vram_total_gb": round(total, 2),
                 "vram_low": free < 2.0}
