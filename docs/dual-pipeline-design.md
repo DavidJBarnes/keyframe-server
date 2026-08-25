@@ -182,18 +182,59 @@ it cannot say, `expression` can.
 Inferring it from the prompt would put product judgement inside the service.
 The caller knows whether it is changing a garment or a glance.
 
-### D3 — Chaining — OPEN, needs measurement
+### D3 — Chaining — MEASURED 2026-08-25
 
-Face mode should chain far past the measured 2-step limit, since untouched pixels
-stay bit-identical and the warped ones are resampled from the source rather than
-regenerated. **Unverified.** Needs the 5-step chain test scored on *skin texture*
-(Laplacian variance) and visible age, not ArcFace cosine — ArcFace read 0.85 on a
-visibly de-aged face and is why the first chain results were wrong.
+Six segments alternating face/full, scored on face texture and judged on face
+crops at native resolution. Reproduce with `tools/chain_test.py` and
+`tools/chain_anchored_test.py`.
+
+| segment | | chained | anchored |
+|---|---|---|---|
+| seg1 | face  slight smile | 31% | 31% |
+| seg2 | full  turtleneck | 21% | 22% |
+| seg3 | face  glance left | 9% | **15%** |
+| seg4 | full  kitchen bg | 10% | 10% |
+| seg5 | face  warmer smile | 6% | **9%** |
+| seg6 | full  coffee mug | 5% | **10%** |
+
+Chained collapses toward zero; anchored flattens around 9-15%. seg1 is identical
+in both (depth 1) and seg4 ties, which is the check that the difference is
+generation depth and not seed luck. Visually the last three columns are the tell:
+anchored keeps forehead lines, crow's feet and under-eye detail where chained has
+gone plastic and reads as a younger woman.
+
+**Face mode degrades texture faster per step than full mode.** Per-step drops
+were 100->31, 21->9, 10->6 for face against 31->21, 9->10, 6->5 for full. Every
+face pass re-decodes the whole crop through the 256x256 bottleneck, so a
+"surgical" edit costs more skin than a whole-frame regeneration. This inverts the
+intuition the mode split invites, and is worth knowing before designing around it.
+
+`detail_restore` cannot rescue a chain: it restores from the *input*, which by
+seg3 is already degraded, so it faithfully restores degraded texture. It stops a
+single edit from softening; it cannot undo accumulated loss.
+
+**This confirms a rule `ltx-keyframe-recipe.md` already states** — "always edit
+from the canonical source frame, never chain edits; one source, N branches." The
+measurement did not discover the strategy, it quantified why the rule is right.
+
+Anchoring costs segment-to-segment continuity (mean consecutive drift 22.65 vs
+13.71), but less than that number suggests: interior keyframes condition at
+weight 0.6-0.7 precisely so LTX blends rather than snaps, and the transitions
+where anchored looks worst are discrete state changes, which the recipe says
+should be cuts rather than interpolations.
+
+Untested idea: anchor identity while chaining scene — previous segment as the
+base image, original as a second reference. `mode=full` accepts 3 image_urls so
+it can be tried today with no server change; the face path would need a
+`detail_source` field to restore texture from a caller-supplied anchor rather
+than from the (degraded) input.
 
 ## 8. Remaining work
 
-- [ ] Bake the custom node, its deps, and the six model files into `docker/Dockerfile`
-- [ ] Set `YOLO_CONFIG_DIR=/tmp/ultralytics` (ultralytics warns on a read-only HOME)
-- [ ] Rebuild, redeploy, verify `mode=full` is byte-unchanged
-- [ ] Run D3's chain test
+- [x] Bake the custom node, its deps, and the six model files into `docker/Dockerfile`
+- [x] Set `YOLO_CONFIG_DIR=/tmp/ultralytics` (ultralytics warns on a read-only HOME)
+- [x] Rebuild, redeploy, verify `mode=full` still works — deployed 86735cd
+- [x] Run D3's chain test
 - [ ] Decide on `ultralytics` AGPL before any commercial deployment
+- [ ] Try anchor-identity-while-chaining-scene (see D3); needs `detail_source`
+      on the face path
