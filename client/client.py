@@ -181,7 +181,7 @@ def main():
     ap = argparse.ArgumentParser(description="Keyframe gen: local Qwen server or fal.ai")
     ap.add_argument("-i", "--image", action="append", required=True,
                     help="input image path or URL (repeatable; first = source frame)")
-    ap.add_argument("-p", "--prompt", required=True, help="edit instruction")
+    ap.add_argument("-p", "--prompt", default="", help="edit instruction")
     ap.add_argument("-o", "--output", required=True, help="output path (.png)")
     ap.add_argument("-n", "--num", type=int, default=1, help="variants to generate (1-4)")
     ap.add_argument("--model", choices=[*SERVERS, *FAL_MODELS], default="local",
@@ -207,6 +207,26 @@ def main():
     ap.add_argument("--face-pad", type=float, default=None, metavar="F",
                     help="face mode: expand the detected face box by this factor "
                          "before cropping (server default 1.6)")
+    ap.add_argument("--expr", action="append", default=None, metavar="K=V",
+                    help="mode=face: exact expression value, repeatable. "
+                         "e.g. --expr smile=0.4 --expr rotate_yaw=5. Overrides "
+                         "any expression read from --prompt. Keys: "
+                         "smile blink wink eyebrow pupil_x pupil_y aaa eee woo "
+                         "rotate_pitch rotate_yaw rotate_roll")
+    ap.add_argument("--sample-ratio", type=float, default=None, metavar="F",
+                    help="mode=face: strength of expression copied from a second "
+                         "-i image (-0.2 to 1.2, default 1.0)")
+    ap.add_argument("--sample-parts", default=None,
+                    choices=["OnlyExpression", "OnlyRotation", "OnlyMouth",
+                             "OnlyEyes", "All"],
+                    help="mode=face: which channels to copy from the second image")
+    ap.add_argument("--detail-restore", type=float, default=None, metavar="F",
+                    help="mode=face: 0-1, default 1.0. Restores source skin texture "
+                         "wherever the warp moved nothing. 0 returns LivePortrait's "
+                         "output raw (softer)")
+    ap.add_argument("--src-ratio", type=float, default=None, metavar="F",
+                    help="mode=face: how much of the subject's resting expression "
+                         "to keep (0-1, default 1.0). Below 1 relaxes toward neutral")
     ap.add_argument("--denoise", type=float, default=None, metavar="F",
                     help="0<F<=1 (local only). Below 1.0 sampling starts from the source "
                          "image instead of noise, so only part of it is redrawn: ~0.2-0.4 "
@@ -223,6 +243,14 @@ def main():
                     help="normalize output to WxH (e.g. 512x768), /32 enforced")
     ap.add_argument("--quiet", action="store_true", help="suppress queue logs")
     args = ap.parse_args()
+
+    # A prompt is optional only in face mode, and only when something else says
+    # what to do: explicit values, or a second image to copy an expression from.
+    if not args.prompt and not (args.mode == "face" and (args.expr or len(args.image) > 1)):
+        sys.exit("--prompt is required (omit it only with --mode face plus "
+                 "--expr or a second -i image)")
+    if args.expr and args.mode != "face":
+        sys.exit("--expr only applies to --mode face")
 
     if args.denoise is not None and not (0.0 < args.denoise <= 1.0):
         sys.exit(f"--denoise must be in (0, 1], got {args.denoise}")
@@ -285,6 +313,25 @@ def main():
         payload["mode"] = args.mode
         if args.face_pad is not None:
             payload["face_pad"] = args.face_pad
+        if args.expr:
+            expr = {}
+            for kv in args.expr:
+                if "=" not in kv:
+                    sys.exit(f"--expr expects KEY=VALUE, got {kv!r}")
+                k, v = kv.split("=", 1)
+                try:
+                    expr[k.strip()] = float(v)
+                except ValueError:
+                    sys.exit(f"--expr {k}: {v!r} is not a number")
+            payload["expression"] = expr
+        if args.sample_ratio is not None:
+            payload["sample_ratio"] = args.sample_ratio
+        if args.sample_parts is not None:
+            payload["sample_parts"] = args.sample_parts
+        if args.src_ratio is not None:
+            payload["src_ratio"] = args.src_ratio
+        if args.detail_restore is not None:
+            payload["detail_restore"] = args.detail_restore
         if args.size:
             # Generate at this size rather than only shrinking the result. Output
             # resolution drives compute directly: 0.39MP takes ~6s and 7MP takes

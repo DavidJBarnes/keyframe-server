@@ -51,12 +51,21 @@ CFG = float(os.environ.get("CFG", "1.0"))
 # Ceiling for the auto-chosen output size. Only applies when the caller does not
 # specify width/height.
 MAX_MP = float(os.environ.get("MAX_MP", "1.2"))
-# Face mode: how far to expand the detected face box before cropping. The box
-# alone is jaw-to-brow; without context the composite seam lands mid-cheek and
-# the model has no hairline or neck to anchor against.
+# Face mode: ExpressionEditor's crop_factor. How far past the detected face box
+# to take the warp region — it needs hairline and jaw to anchor against, not the
+# bare jaw-to-brow box. This no longer controls a composite seam (the node masks
+# its own), so it is purely about how much context the warp sees.
 FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
+# Detail restoration for face mode. ExpressionEditor decodes through a fixed
+# 256x256 bottleneck, so it softens the entire crop — including the parts it did
+# not move. Measured on a 214x292 face: texture falls to 16% of source, and
+# crop_factor cannot fix it (the node clamps to 1.5-2.5, and 1.5 is already the
+# sharp end). These thresholds ramp the handover on |output - source|: below LO
+# the node changed nothing worth keeping, so the source pixel wins.
+DETAIL_LO = float(os.environ.get("DETAIL_LO", "6.0"))
+DETAIL_HI = float(os.environ.get("DETAIL_HI", "22.0"))
+DETAIL_BLUR = float(os.environ.get("DETAIL_BLUR", "2.0"))
 # Fraction of the crop's smaller side blended at the boundary.
-FACE_FEATHER = float(os.environ.get("FACE_FEATHER", "0.12"))
 # YuNet, a small DNN detector. OpenCV 5 dropped CascadeClassifier from the top
 # level, and YuNet is the better tool regardless: Haar cascades miss angled and
 # partially occluded faces, which is most of a real keyframe set. The model is a
@@ -84,10 +93,11 @@ async def lifespan(_app: FastAPI):
     shown = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
     print("\n" + "=" * 62, flush=True)
     print("  READY — accepting requests", flush=True)
-    print(f"    POST   http://{shown}:{port}/edit", flush=True)
+    print(f"    POST   http://{shown}:{port}/generate", flush=True)
     print(f"    GET    http://{shown}:{port}/health", flush=True)
-    print(f"    backend ComfyUI {COMFY}  ckpt={CKPT}", flush=True)
-    print(f"    {SAMPLER}/{SCHEDULER}  steps={STEPS}  cfg={CFG}", flush=True)
+    print(f"    mode=full  ComfyUI {COMFY}  ckpt={CKPT}", flush=True)
+    print(f"               {SAMPLER}/{SCHEDULER}  steps={STEPS}  cfg={CFG}", flush=True)
+    print(f"    mode=face  LivePortrait ExpressionEditor  crop_factor={FACE_PAD}", flush=True)
     print("=" * 62 + "\n", flush=True)
     yield
     print("\n[server] shutting down", flush=True)
@@ -96,16 +106,146 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="qwen-edit-comfy", lifespan=lifespan)
 
 
+# --- mode=face: LivePortrait expression parameters ---------------------------
+#
+# ExpressionEditor warps the source pixels through implicit keypoints and
+# composites the result back behind a face mask, so pixels outside the face are
+# bit-identical to the input. That is why face mode moved off Qwen: every Qwen
+# pass halves skin texture (Laplacian variance 1015 -> ~450) and de-ages the
+# subject, at every denoise setting. See docs/dual-pipeline-design.md.
+#
+# Ranges are the node's own (nodes.py:846-865) and are enforced here so an
+# out-of-range value fails as a 422 rather than a ComfyUI validation error.
+class Expression(BaseModel):
+    rotate_pitch: float = Field(0, ge=-20, le=20)
+    rotate_yaw: float = Field(0, ge=-20, le=20)
+    rotate_roll: float = Field(0, ge=-20, le=20)
+    blink: float = Field(0, ge=-20, le=5)
+    eyebrow: float = Field(0, ge=-10, le=15)
+    wink: float = Field(0, ge=0, le=25)
+    pupil_x: float = Field(0, ge=-15, le=15)
+    pupil_y: float = Field(0, ge=-15, le=15)
+    aaa: float = Field(0, ge=-30, le=120)      # jaw open
+    eee: float = Field(0, ge=-20, le=15)       # wide mouth
+    woo: float = Field(0, ge=-20, le=15)       # pursed mouth
+    smile: float = Field(0, ge=-0.3, le=1.3)
+
+
+# Prompt sugar over the numeric contract. Deliberately small and explicit: a
+# caller that wants exact control passes `expression` and skips all of this.
+# Longer patterns are matched first so "look up" cannot shadow "look upper left".
+_LEXICON: list[tuple[str, dict]] = [
+    (r"\bwid(e|er) eyes?\b|\beyes? wide\b", {"blink": 4}),
+    (r"\bsquint(s|ed|ing)?\b|\bnarrow(ed)? eyes?\b", {"blink": -8}),
+    (r"\bclos(e|es|ed|ing) (her |his |their )?eyes?\b|\beyes? clos(ed|ing)\b", {"blink": -18}),
+    (r"\bblink(s|ed|ing)?\b", {"blink": -12}),
+    (r"\bwink(s|ed|ing)?\b", {"wink": 15}),
+    (r"\brais(e|es|ed|ing) (her |his |their )?(eye)?brows?\b|\b(eye)?brows? rais(ed|e)\b", {"eyebrow": 8}),
+    (r"\bfurrow(s|ed|ing)?\b|\bfrown(s|ed|ing)?\b", {"eyebrow": -6, "smile": -0.2}),
+    (r"\bgrin(s|ning)?\b|\bbig smile\b|\bbroad smile\b", {"smile": 1.0}),
+    (r"\bsmil(e|es|ing)\b", {"smile": 0.5}),
+    (r"\blaugh(s|ed|ing)?\b", {"smile": 0.9, "aaa": 35}),
+    (r"\bmouth open\b|\bopens? (her |his |their )?mouth\b|\bgasp(s|ed|ing)?\b", {"aaa": 45}),
+    (r"\bpurs(e|es|ed|ing)\b|\bpout(s|ed|ing)?\b|\bwhistl(e|es|ing)\b", {"woo": 10}),
+    (r"\blook(s|ing)? (to (her |his |their )?)?left\b|\bglanc(e|es|ing) left\b", {"pupil_x": -8}),
+    (r"\blook(s|ing)? (to (her |his |their )?)?right\b|\bglanc(e|es|ing) right\b", {"pupil_x": 8}),
+    (r"\blook(s|ing)? up\b|\bglanc(e|es|ing) up\b|\beyes? up\b", {"pupil_y": 8}),
+    (r"\blook(s|ing)? down\b|\bglanc(e|es|ing) down\b|\beyes? down\b|\blower(s|ed|ing)? (her |his |their )?gaze\b", {"pupil_y": -8}),
+    (r"\bturn(s|ed|ing)? (her |his |their )?head (to the )?left\b|\bhead left\b", {"rotate_yaw": -12}),
+    (r"\bturn(s|ing)? (her |his |their )?head (to the )?right\b|\bhead right\b", {"rotate_yaw": 12}),
+    (r"\btilt(s|ed|ing)? (her |his |their )?head\b|\bhead tilt(ed)?\b", {"rotate_roll": 8}),
+    (r"\bchin up\b|\blift(s|ed|ing)? (her |his |their )?chin\b|\bhead up\b", {"rotate_pitch": -8}),
+    (r"\bchin down\b|\bhead down\b|\bduck(s|ing)? (her |his |their )?head\b", {"rotate_pitch": 8}),
+]
+
+# Intensity adverbs scale whatever they precede. Applied globally rather than
+# per-phrase: prompts at this length rarely mix intensities, and per-phrase
+# scoping would need a parser rather than a regex sweep.
+_INTENSITY = [
+    (r"\b(slight(ly)?|soft(ly)?|faint(ly)?|soften(ed|s)?|subtle|barely|a little|a bit|gentl[ey])\b", 0.5),
+    (r"\b(very|much|strong(ly)?|wide(ly)?|big|broad(ly)?|deep(ly)?|hard)\b", 1.5),
+]
+
+
+def resolve_expression(req: "GenerateRequest") -> tuple[Expression, str]:
+    """Numeric expression wins; otherwise read the prompt. Returns (exp, source)."""
+    if req.expression is not None:
+        return req.expression, "explicit"
+
+    text = (req.prompt or "").lower()
+    params: dict[str, float] = {}
+    hits: list[str] = []
+    for pattern, delta in _LEXICON:
+        if re.search(pattern, text):
+            hits.append(pattern.split("\\b")[1] if "\\b" in pattern else pattern)
+            for k, v in delta.items():
+                # Largest magnitude wins when two phrases drive the same axis,
+                # so "smiling and grinning" gives one grin, not a summed clamp.
+                if abs(v) > abs(params.get(k, 0.0)):
+                    params[k] = v
+
+    scale = 1.0
+    for pattern, factor in _INTENSITY:
+        if re.search(pattern, text):
+            scale = factor
+            break
+    if scale != 1.0:
+        params = {k: v * scale for k, v in params.items()}
+
+    if not params and req.image_urls[1:] == []:
+        raise HTTPException(
+            422,
+            "mode=face needs something to apply: an `expression` object, a prompt "
+            "using a known term, or a second image to copy an expression from. "
+            "Recognised terms: smile, grin, laugh, frown, blink, wink, squint, "
+            "wide eyes, closed eyes, raised brows, open mouth, purse/pout, "
+            "look left/right/up/down, turn head left/right, tilt head, chin up/down.",
+        )
+
+    # Clamp to the node's ranges — an intensity multiplier can overshoot.
+    fields = Expression.model_fields
+    for k, v in list(params.items()):
+        f = fields[k]
+        lo = next(m.ge for m in f.metadata if hasattr(m, "ge"))
+        hi = next(m.le for m in f.metadata if hasattr(m, "le"))
+        params[k] = max(lo, min(hi, v))
+
+    return Expression(**params), ("prompt:" + ",".join(hits) if hits else "driver-only")
+
+
 class GenerateRequest(BaseModel):
-    prompt: str
-    # "full": regenerate the whole frame (default, and what every edit did before
-    #         face mode existed).
-    # "face": detect the largest face in image_urls[0], edit only that region and
-    #         composite it back. Everything outside the crop is copied verbatim,
-    #         so it cannot drift — which whole-frame regeneration cannot promise:
-    #         asked to change nothing, it still moves ~9/255 per pass.
+    # Optional in face mode when `expression` is supplied — the transform there
+    # is parametric, not textual.
+    prompt: str = ""
+    # "full": regenerate the whole frame with Qwen. Garments, scenes, props,
+    #         composition — anything that needs new pixels invented.
+    # "face": warp the face with LivePortrait. Expression, gaze, small head
+    #         rotation. Pixels outside the face mask are bit-identical to the
+    #         input, and the pixels inside are warped from the source rather
+    #         than regenerated, so identity and skin texture survive.
+    #
+    # The split is not a preference. Qwen cannot do the face case: it halves
+    # skin texture on every pass at every denoise setting. LivePortrait cannot
+    # do the full case: it only articulates a face it can already see.
     mode: str = Field(default="full", pattern="^(full|face)$")
     face_pad: float | None = Field(default=None, gt=1.0, le=4.0)
+
+    # --- face mode only ---
+    expression: Expression | None = None
+    # With a second image supplied, its expression is copied onto the first.
+    # `sample_ratio` scales the transfer; `sample_parts` limits which channels
+    # come across. Numeric `expression` values are added on top.
+    sample_ratio: float = Field(default=1.0, ge=-0.2, le=1.2)
+    sample_parts: str = Field(
+        default="OnlyExpression",
+        pattern="^(OnlyExpression|OnlyRotation|OnlyMouth|OnlyEyes|All)$",
+    )
+    # How much of the subject's own resting expression to retain. Below 1.0 the
+    # face relaxes toward neutral before the requested change is applied.
+    src_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    # 1.0 restores source texture everywhere the warp did not move anything;
+    # 0 returns the node's output untouched. See restore_detail().
+    detail_restore: float = Field(default=1.0, ge=0.0, le=1.0)
     image_urls: list[str] = Field(min_length=1, max_length=3)
     num_images: int = Field(default=1, ge=1, le=4)
     seed: int | None = None
@@ -168,38 +308,70 @@ def detect_face(im: Image.Image) -> tuple[int, int, int, int]:
     return tuple(int(v) for v in faces[0])
 
 
-def face_crop_box(im: Image.Image, pad: float) -> tuple[int, int, int, int]:
-    """Face box expanded by `pad` and clamped to the image."""
-    x, y, w, h = detect_face(im)
-    cx, cy = x + w / 2, y + h / 2
-    half = max(w, h) * pad / 2
-    x0, y0 = int(max(0, cx - half)), int(max(0, cy - half))
-    x1, y1 = int(min(im.width, cx + half)), int(min(im.height, cy + half))
-    return x0, y0, x1, y1
+def restore_detail(source: Image.Image, edited: Image.Image,
+                   strength: float = 1.0) -> Image.Image:
+    """Take the source's pixels back wherever LivePortrait did not move anything.
 
+    The node's decoder softens the whole face crop uniformly, but an expression
+    change only moves part of it — a smile leaves the forehead alone. Blending
+    on |edited - source| keeps the edit where it happened and the original
+    texture everywhere else, which measured 16% -> 31% of source texture with no
+    visible seam. Alpha is blurred so the handover has no hard edges.
 
-def composite_face(original: Image.Image, edited: Image.Image,
-                   box: tuple[int, int, int, int], feather: float) -> Image.Image:
-    """Blend `edited` back into `original` over `box` with a feathered edge.
-
-    A hard paste shows a visible rectangle even when the content matches, because
-    the model shifts tone slightly across the whole crop. Feathering trades a thin
-    band of blended pixels for an invisible join.
+    Not a sharpening filter and not a restoration model: every pixel here comes
+    from one of the two real images, so it cannot invent detail or alter age.
     """
-    x0, y0, x1, y1 = box
-    bw, bh = x1 - x0, y1 - y0
-    edited = edited.resize((bw, bh), Image.LANCZOS)
+    if strength <= 0:
+        return edited
+    s = np.asarray(source, np.float32)
+    e = np.asarray(edited, np.float32)
+    if s.shape != e.shape:
+        return edited
+    d = np.abs(e - s).mean(2)
+    a = np.clip((d - DETAIL_LO) / max(1e-6, DETAIL_HI - DETAIL_LO), 0, 1)
+    a = cv2.GaussianBlur(a, (0, 0), DETAIL_BLUR)[..., None]
+    a = 1.0 - (1.0 - a) * strength      # strength<1 keeps more of the node's output
+    return Image.fromarray(np.clip(s * (1 - a) + e * a, 0, 255).astype(np.uint8))
 
-    r = max(1, int(min(bw, bh) * feather))
-    mask = np.zeros((bh, bw), np.float32)
-    mask[r:bh - r, r:bw - r] = 1.0
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=r / 2.0, sigmaY=r / 2.0)
 
-    base = np.array(original).astype(np.float32)
-    patch = np.array(edited).astype(np.float32)
-    region = base[y0:y1, x0:x1]
-    base[y0:y1, x0:x1] = region * (1 - mask[..., None]) + patch * mask[..., None]
-    return Image.fromarray(np.clip(base, 0, 255).astype(np.uint8))
+def build_face_workflow(req: GenerateRequest, filenames: list[str],
+                        exp: Expression) -> dict:
+    """LivePortrait graph for mode=face.
+
+    No checkpoint, no sampler, no VAE — the transform is a keypoint warp, so
+    seed/steps/cfg/denoise have no meaning here and are ignored.
+
+    Note the SaveImage wiring: ExpressionEditor is an OUTPUT_NODE whose UI
+    preview is the *face crop only* (nodes.py:955). The full-frame composite is
+    output 0, so it must be saved explicitly — reading the preview would return
+    crops instead of keyframes.
+    """
+    pad = req.face_pad if req.face_pad is not None else FACE_PAD
+
+    editor = {
+        "src_image": ["101", 0],
+        "crop_factor": pad,
+        "src_ratio": req.src_ratio,
+        "sample_ratio": req.sample_ratio,
+        "sample_parts": req.sample_parts,
+        **exp.model_dump(),
+    }
+
+    wf: dict = {
+        "101": {"class_type": "LoadImage",
+                "inputs": {"image": filenames[0], "upload": "image"}},
+        "200": {"class_type": "ExpressionEditor", "inputs": editor},
+        "6": {"class_type": "SaveImage",
+              "inputs": {"images": ["200", 0], "filename_prefix": "keyframe"}},
+    }
+
+    # A second image is a driving reference: its expression is read and applied.
+    if len(filenames) > 1:
+        wf["102"] = {"class_type": "LoadImage",
+                     "inputs": {"image": filenames[1], "upload": "image"}}
+        wf["200"]["inputs"]["sample_image"] = ["102", 0]
+
+    return wf
 
 
 def build_workflow(req: GenerateRequest, filenames: list[str], w: int, h: int) -> dict:
@@ -286,22 +458,38 @@ def generate(req: GenerateRequest):
     images = [decode_image(u) for u in req.image_urls]
     t_decode = time.time() - t0
 
-    # --- face mode: work on a crop, restore the rest verbatim -----------------
+    # --- face mode: LivePortrait, a different pipeline entirely ---------------
     #
-    # Only the FIRST image is cropped: it is the frame being edited. Any further
-    # references are passed through whole, since they usually say what something
-    # should look like rather than which pixels to change. A caller wanting a
-    # cropped reference can crop it itself.
+    # Returns at the source's own size with everything outside the face mask
+    # untouched, so none of the latent-sizing or compositing below applies.
+    if req.mode == "face":
+        exp, how = resolve_expression(req)
+        # Preflight so a faceless frame is a clean 422 rather than an opaque
+        # ComfyUI failure. The node's own detector picks the centre-most face
+        # while this picks the largest; they only disagree on crowded frames,
+        # and this is only ever used to answer "is there a face at all".
+        detect_face(images[0])
+        nonzero = {k: v for k, v in exp.model_dump().items() if v}
+        driver = f" +driver({req.sample_parts}@{req.sample_ratio})" if len(images) > 1 else ""
+        print(f"[{rid}] mode=face {images[0].width}x{images[0].height} | "
+              f"src={how}{driver} | {nonzero or 'neutral'}", flush=True)
+
+        t1 = time.time()
+        filenames = [comfy_upload(im) for im in images[:2]]
+        t_upload = time.time() - t1
+
+        t2 = time.time()
+        outs = run_workflow(build_face_workflow(req, filenames, exp))
+        t_run = time.time() - t2
+
+        t3 = time.time()
+        results = [Image.open(io.BytesIO(fetch_output(o))).convert("RGB") for o in outs]
+        if req.detail_restore > 0:
+            results = [restore_detail(images[0], r, req.detail_restore) for r in results]
+        return _respond(rid, t0, results, outs, t_decode, t_upload, t_run, time.time() - t3)
+
     face_box = None
     original = None
-    if req.mode == "face":
-        original = images[0]
-        pad = req.face_pad if req.face_pad is not None else FACE_PAD
-        face_box = face_crop_box(original, pad)
-        x0, y0, x1, y1 = face_box
-        images[0] = original.crop(face_box)
-        print(f"[{rid}] face mode: box {x0},{y0}-{x1},{y1} "
-              f"({x1 - x0}x{y1 - y0}) from {original.width}x{original.height}", flush=True)
 
     # Latent defaults to the first input's size, but capped: compute scales with
     # output pixels (0.39MP ~6s, 1.55MP ~21s, 7.09MP ~186s), and a phone photo
@@ -353,10 +541,10 @@ def generate(req: GenerateRequest):
 
     t3 = time.time()
     results = [Image.open(io.BytesIO(fetch_output(o))).convert("RGB") for o in outs]
-    if face_box is not None:
-        feather = FACE_FEATHER
-        results = [composite_face(original, r, face_box, feather) for r in results]
+    return _respond(rid, t0, results, outs, t_decode, t_upload, t_run, time.time() - t3)
 
+
+def _respond(rid, t0, results, outs, t_decode, t_upload, t_run, t_fetch):
     payload = {
         "images": [
             {
@@ -368,8 +556,6 @@ def generate(req: GenerateRequest):
         ],
         "description": "",
     }
-    t_fetch = time.time() - t3
-
     try:
         free, total = _vram()
         vram = f" | vram {free:.1f}/{total:.1f} GB free"

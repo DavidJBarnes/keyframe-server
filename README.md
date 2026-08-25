@@ -1,161 +1,172 @@
 # keyframe-server
 
-Local **Qwen-Image-Edit-2511** inference behind a FastAPI endpoint, plus a CLI client
-for building LTX multi-frame conditioning keyframes.
+A stateless image-edit microservice for building **LTX-2.5 multi-frame conditioning
+keyframes**. One image in, one image out, no memory between calls — a storyboard is
+assembled by the caller chaining requests, not by this service knowing what a
+storyboard is.
 
-The server mirrors the fal.ai request/response shape, so the same client can target
-either a hosted fal endpoint or your own GPU.
+Two pipelines behind one endpoint, because no single model does both jobs:
 
-- `server.py` — FastAPI wrapper around the Qwen edit pipeline (`POST /edit`, `GET /health`)
-- `client/client.py` — edit-based keyframe factory ([client README](client/README.md))
-- `docker/` — RunPod image and template ([docker README](docker/README.md))
+| `mode` | engine | for | why not the other |
+|---|---|---|---|
+| `full` | Qwen-Image-Edit (ComfyUI) | garments, scenes, props, composition | LivePortrait only articulates a face it can already see |
+| `face` | LivePortrait ExpressionEditor | expression, gaze, small head rotation | Qwen halves skin texture and de-ages the subject on **every** pass, at every denoise setting |
+
+That split is measured, not stylistic — see [docs/dual-pipeline-design.md](docs/dual-pipeline-design.md).
+
+- `server.py` — the endpoint (`POST /generate`, `GET /health`)
+- `client/client.py` — CLI keyframe factory ([client README](client/README.md))
+- `docker/` — the runtime: ComfyUI + both pipelines ([docker README](docker/README.md))
 - `docs/pipeline-notes.md` — measured findings from the proof-of-concept shots
 
 ---
 
 ## How to run
 
-### On RunPod (recommended)
-
-The packaged path. `davidjbarnes/keyframe-server` on Docker Hub, RunPod template
-`keyframe-server`. Handles the model download, an auth proxy, and correct flags for
-you — see [docker/README.md](docker/README.md).
-
-### Locally
+Everything runs in the container — ComfyUI, both model stacks, and the adapter.
+There is no meaningful "local" mode any more: `server.py` is a thin HTTP adapter
+that talks to a ComfyUI instance, and it needs one to talk to.
 
 ```bash
-python server.py
+docker run -d --name keyframe-server --gpus all --memory 56g \
+  -v ~/models:/workspace/models:ro \
+  -p 8189:8888 \
+  davidjbarnes/keyframe-server:latest
 ```
 
-That's it — the defaults are the validated ones: `--quant fp8`, `--port 8189`
-(8188 is usually ComfyUI), 4-step Lightning, and `expandable_segments` set
-internally to limit CUDA fragmentation.
+The 28 GB Qwen checkpoint is **not** baked into the image — it is bind-mounted from
+the host so the model survives image updates. The LivePortrait models (~500 MB) *are*
+baked in, since they are small and a runtime download would make the first face
+request depend on the network.
 
-The port is checked **before** the model loads, so a collision fails in a second
-rather than after several minutes of loading.
-
-**Setup:**
+Running the adapter by hand against an existing ComfyUI:
 
 ```bash
-python3.11 -m venv venv          # 3.11 or 3.12 — see note below
-source venv/bin/activate
-pip install torch torchvision    # install FIRST, on its own
-pip install -r requirements.txt
+python server.py --comfy-url http://127.0.0.1:8188 --port 8189
 ```
-
-Install `torch` **before** the rest, and let pip pick the default PyPI wheels — they
-bundle their own CUDA runtime. Pinning an old `--index-url` (e.g. `cu124`) makes pip
-backtrack for a long time hunting for a compatible build and may find none.
-
-**Python 3.11 or 3.12, not 3.13** — only because the nunchaku wheel requires `<3.13`.
-Since nunchaku is currently broken anyway (below), 3.13 is fine if you never intend to
-use it.
-
-**Pre-download the weights** (optional; moves the multi-GB pull out of server startup so
-a slow download doesn't look like a hung server):
-
-```bash
-pip install -U "huggingface_hub[cli]"
-
-# base model, 57.7 GB
-hf download Qwen/Qwen-Image-Edit-2511
-
-# Lightning 4-step LoRA, 0.85 GB. Note this is the 2509 file: no 2511 LoRA has ever
-# been published, and the 2509 one applies cleanly to the 2511 transformer.
-hf download lightx2v/Qwen-Image-Lightning \
-    Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors
-```
-
-Everything lands in `$HF_HOME` (default `~/.cache/huggingface`), which is where the
-server looks at load time. Downloads resume if interrupted. Set `HF_HOME` first if you
-want the cache elsewhere — on RunPod it must point at the network volume.
-
-**Options:**
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8189` | Listen port. 8188 avoided — ComfyUI usually has it |
-| `--quant` | `fp8` | `fp8` \| `none` \| `nunchaku` — see below |
-| `--no-lightning` | off | Full 40-step sampling at CFG 4.0 instead of 4-step Lightning |
-| `--nunchaku-variant` | `balance` | Only relevant if nunchaku is ever fixed |
-
-### Quant modes — measured, not theoretical
-
-On a 24 GB 3090, 512x768 input (2026-08-22):
-
-| mode | 24 GB | notes |
-|---|---|---|
-| **`fp8`** | **works — the default** | torchao float8 weight-only, ~20 GB transformer, fits as one resident component under model-level offload. Lightning applies → 4 steps. **~44–72 s/edit** (200 s at 40 steps) |
-| `none` | **OOMs** | `enable_model_cpu_offload()` swaps *whole models*, and the bf16 transformer is ~40 GB — it cannot fit in 23.5 GB regardless of scheduling. Fine on 48 GB+ cards, where it is the better-quality option. |
-| `nunchaku` | **broken** | Two independent blockers — see below |
-
-**nunchaku is currently unusable.** It calls `self.pos_embed(img_shapes, txt_seq_lens,
-device=...)`, but diffusers 0.40 changed the signature to
-`QwenEmbedRope.forward(video_fhw, device=None, max_txt_seq_len=None)`, so it dies with
-`TypeError: got multiple values for argument 'device'`. nunchaku declares
-`diffusers>=0.36` while its CI pins `==0.36`. Separately, PEFT cannot patch its INT4
-`SVDQW4A4Linear` layers, so the Lightning LoRA never attaches and you are stuck at 40
-steps — which removes most of the reason to want INT4 in the first place. Its wheels
-also top out at torch 2.12.
-
-**Leave the sampler alone.** The default (4-step Lightning, cfg 1.0) has produced the
-best result on every test so far, and is ~8x faster than the alternatives. Raising
-`--steps`/`--cfg` measurably makes things *worse*: with Lightning attached it stylises
-the whole frame into a cartoon, and with `--no-lightning` the edit stops happening at
-all. Details and numbers in `docs/pipeline-notes.md` §7b.
-
-If an edit comes back wrong, re-roll the seed and use imperative phrasing
-(`"Change X to Y. Keep everything else identical."`) rather than reaching for the
-sampler knobs.
-
-The server prints what it actually resolved at startup, which is worth reading rather
-than assuming:
-
-```
-[lightning] active -> 4 steps, cfg 1.0
-[pipeline] ready: quant=fp8 steps=4 cfg=1.0
-```
+| `--port` | `8189` | 8188 avoided — ComfyUI usually has it |
+| `--comfy-url` | `http://127.0.0.1:8188` | Backend to drive |
+| `--ckpt` | `Qwen-Rapid-AIO-NSFW-v23.safetensors` | `mode=full` checkpoint |
+| `--wait-for-comfy` | `600` | Seconds to wait for the backend before giving up |
 
 **Verify it's up:**
 
 ```bash
 curl -s localhost:8189/health
-# {"status":"ok","vram_free_gb":21.4,"vram_total_gb":25.4}
+# {"status":"ok","backend":"comfyui","ckpt":"Qwen-Rapid-AIO-NSFW-v23.safetensors",
+#  "vram_free_gb":21.4,"vram_total_gb":25.4,"vram_low":false}
 ```
 
-**Hitting the endpoint directly:**
+`/health` returns 503 until ComfyUI answers, so a green health check means the whole
+chain is live — not just that the adapter bound a port.
+
+---
+
+## The endpoint
+
+`POST /generate`. `image_urls` takes 1–3 entries, each a **data URI** or an
+**http(s) URL** — file paths are rejected. Responses are base64 data URIs; the
+server never writes to disk.
+
+### `mode: "full"` — Qwen
 
 ```bash
-curl -s localhost:8189/edit \
-  -H 'content-type: application/json' \
-  -d '{
-    "prompt": "Change her shirt to a dark green sweater. Keep everything else identical.",
-    "image_urls": ["data:image/png;base64,iVBORw0KG..."],
-    "num_images": 1,
-    "seed": 42
-  }' | jq -r '.images[0].url' | sed 's/^data:image\/png;base64,//' | base64 -d > out.png
+curl -s localhost:8189/generate -H 'content-type: application/json' -d '{
+  "prompt": "Change her shirt to a dark green sweater. Keep everything else identical.",
+  "mode": "full",
+  "image_urls": ["data:image/png;base64,iVBORw0KG..."],
+  "seed": 42
+}'
 ```
 
-`image_urls` takes 1–3 entries, each a **data URI** or an **http(s) URL** — file paths
-are rejected. Responses come back as base64 data URIs; the server never writes to disk.
-Output resolution is chosen by the model (~1 MP), not by your input.
+Fields: `seed`, `num_inference_steps`, `true_cfg_scale`, `negative_prompt`,
+`denoise`, `width`/`height`, `num_images`.
 
-Optional body fields: `seed`, `num_inference_steps`, `true_cfg_scale`.
+Output matches the first input's size unless `width`/`height` say otherwise, capped
+at `MAX_MP` (1.2 MP). Output pixels drive the cost: 0.39 MP ≈ 6 s, 1.55 MP ≈ 21 s,
+7.09 MP ≈ 186 s — and a raw phone photo is ~7 MP.
 
-**Prompt phrasing matters.** Imperative edits (`"Change X to Y. Keep everything else
-identical."`) behave; descriptive restatement (`"the same woman, now wearing X"`) can
-make the model emit a side-by-side before/after pair. See `docs/pipeline-notes.md`.
+**Leave the sampler alone.** 4-step Lightning at cfg 1.0 has beaten every
+alternative tested; raising steps or cfg measurably makes things *worse*. If an
+edit comes back wrong, re-roll the seed and use imperative phrasing
+(`"Change X to Y. Keep everything else identical."`) rather than reaching for the
+knobs. Descriptive restatement (`"the same woman, now wearing X"`) can make the
+model emit a side-by-side before/after pair. Details in
+`docs/pipeline-notes.md` §7b.
 
-**Running it as a background service:**
+### `mode: "face"` — LivePortrait
 
-```bash
-nohup python server.py > server.log 2>&1 &
-tail -f server.log
+Three ways to say what the face should do. They land on the same node inputs, and
+`expression` wins if you supply it.
+
+**Exact** — the honest contract, and what a UI's sliders should send:
+
+```jsonc
+{"mode": "face", "image_urls": ["data:..."],
+ "expression": {"smile": 0.4, "blink": -3, "rotate_yaw": 5}}
 ```
 
-Model load happens *before* uvicorn binds the port, so a refused connection during the
-first minutes means it's still loading, not that it crashed.
+| key | range | key | range |
+|---|---|---|---|
+| `smile` | -0.3 … 1.3 | `pupil_x` / `pupil_y` | ±15 |
+| `blink` | -20 … 5 | `rotate_pitch`/`yaw`/`roll` | ±20 |
+| `wink` | 0 … 25 | `aaa` (jaw open) | -30 … 120 |
+| `eyebrow` | -10 … 15 | `eee` / `woo` (mouth) | -20 … 15 |
+
+Out-of-range values are a 422, not a silent clamp.
+
+**Prompt** — sugar over a small fixed vocabulary:
+
+```jsonc
+{"mode": "face", "image_urls": ["data:..."], "prompt": "soften her smile, look left"}
+```
+
+Recognised: smile, grin, laugh, frown, blink, wink, squint, wide/closed eyes,
+raised brows, open mouth, purse/pout, look left/right/up/down, turn head
+left/right, tilt head, chin up/down. `slight`/`soft`/`soften` scale to 0.5x;
+`big`/`very`/`wide` to 1.5x. A face request matching none of these returns a 422
+listing them rather than silently returning the input unchanged.
+
+**Driving image** — copy an expression off a reference:
+
+```jsonc
+{"mode": "face", "image_urls": ["source", "driver"],
+ "sample_ratio": 0.7, "sample_parts": "OnlyExpression"}
+```
+
+`sample_parts` ∈ `OnlyExpression | OnlyRotation | OnlyMouth | OnlyEyes | All`;
+`sample_ratio` -0.2 … 1.2 scales the transfer.
+
+Also: `face_pad` (crop_factor, 1.5–2.5 — how much context the warp sees; lower is
+sharper), `src_ratio` (below 1.0 relaxes the resting expression toward neutral
+first), and `detail_restore` (0–1, default 1.0).
+
+**About `detail_restore`.** LivePortrait decodes through a fixed 256×256
+bottleneck, so it softens the whole face crop — including the parts it did not
+move. Detail restoration blends on `|output − source|`, keeping the node's pixels
+only where it actually moved something and taking the original's back everywhere
+else. Measured on a 214×292 face: texture 16% → 31% of source, forehead lines and
+hair strands visibly recovered, expression untouched. Every output pixel comes
+from one of the two real images, so it cannot invent detail or shift apparent age.
+Set it to 0 to see the raw node output.
+
+Measured, richmond kf1 (512×768):
+
+| | face texture | drift outside warp | time |
+|---|---|---|---|
+| source | 1405 | — | — |
+| raw | 227 (16%) | **0.0000** | 1.0 s |
+| `detail_restore: 1.0` | 441 (31%) | **0.0000** | 1.0 s |
+| Qwen `mode=full` | ~45% | whole frame drifts | 44–72 s |
+
+`seed`, `steps`, `cfg` and `denoise` have **no meaning in face mode** and are
+ignored — the transform is a deterministic keypoint warp. Same input, same
+parameters, same output, every time. Output is always the source's own size, with
+every pixel outside the face mask bit-identical to the input.
 
 ---
 
