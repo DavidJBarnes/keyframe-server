@@ -2,7 +2,12 @@
 # ComfyUI must never be asked to write here.
 keyframe:
     base_path: /workspace/models
-    checkpoints: qwen/v23/
+    # Multiple version dirs so checkpoints can be switched with CKPT_NAME alone,
+    # without an image rebuild.
+    checkpoints: |
+        qwen/v19/
+        qwen/v20/
+        qwen/v23/
     loras: qwen/
     vae: vae/
     clip: clip/
