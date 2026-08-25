@@ -57,7 +57,24 @@ MAX_MP = float(os.environ.get("MAX_MP", "1.2"))
 FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
 # Fraction of the crop's smaller side blended at the boundary.
 FACE_FEATHER = float(os.environ.get("FACE_FEATHER", "0.12"))
-_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# YuNet, a small DNN detector. OpenCV 5 dropped CascadeClassifier from the top
+# level, and YuNet is the better tool regardless: Haar cascades miss angled and
+# partially occluded faces, which is most of a real keyframe set. The model is a
+# ~350KB ONNX file baked into the image.
+YUNET_PATH = os.environ.get("YUNET_PATH", "/opt/face_detection_yunet.onnx")
+_DETECTOR = None
+
+
+def _detector(width: int, height: int):
+    """YuNet instance sized to the current image (it needs explicit input size)."""
+    global _DETECTOR
+    if _DETECTOR is None:
+        if not os.path.exists(YUNET_PATH):
+            raise HTTPException(500, f"face detector model missing at {YUNET_PATH}")
+        _DETECTOR = cv2.FaceDetectorYN.create(YUNET_PATH, "", (width, height),
+                                              score_threshold=0.6)
+    _DETECTOR.setInputSize((width, height))
+    return _DETECTOR
 BIND = ("0.0.0.0", 8189)
 
 
@@ -138,9 +155,11 @@ def comfy_upload(im: Image.Image) -> str:
 
 
 def detect_face(im: Image.Image) -> tuple[int, int, int, int]:
-    """Largest frontal face as (x, y, w, h). Raises 422 if none found."""
-    arr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2GRAY)
-    faces = sorted(_CASCADE.detectMultiScale(arr, 1.05, 5), key=lambda b: -b[2] * b[3])
+    """Largest face as (x, y, w, h). Raises 422 if none found."""
+    bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+    _, dets = _detector(im.width, im.height).detect(bgr)
+    faces = [] if dets is None else sorted(
+        (d[:4] for d in dets), key=lambda b: -(b[2] * b[3]))
     if not len(faces):
         # Deliberately an error rather than a silent fall back to full mode:
         # quietly doing something different is how a caller ends up debugging

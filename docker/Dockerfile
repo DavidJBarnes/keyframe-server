@@ -43,6 +43,12 @@ ADD https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO/resolve/main/fixed-t
 RUN pip install --no-cache-dir "fastapi==0.141.1" "uvicorn==0.52.4" \
         "opencv-python-headless" "numpy"
 
+# YuNet face detector for mode=face. OpenCV 5 removed CascadeClassifier from the
+# top-level API, and YuNet is the better detector anyway — Haar misses angled and
+# partially occluded faces, which most real keyframes contain.
+ADD https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
+    /opt/face_detection_yunet.onnx
+
 ENV COMFY_URL=http://127.0.0.1:8188 \
     CKPT_NAME=Qwen-Rapid-AIO-NSFW-v23.safetensors \
     SAMPLER=euler_ancestral \
