@@ -58,7 +58,21 @@ wider...", seed 88, checkpoint Qwen-Rapid-AIO-NSFW-v23.
 
 ---
 
-## 1. Try a non-ancestral sampler  — cheap, do first
+## 1. Try a non-ancestral sampler  — TESTED 2026-08-25, DOES NOT HELP
+
+**Result: `euler` is worse than `euler_ancestral` on every micro measure.** The
+noise floor rose on both checkpoints (v23 9.05 -> 11.03) and `macro_scene` face drift
+nearly tripled (8.80 -> 24.63) when only the background should have changed.
+
+The reasoning was wrong: ancestral noise fights preservation on a normal img2img model,
+but this workflow samples from an EMPTY latent at denoise 1.0 — there is no source latent
+for the noise to disturb. Lightning is distilled for 4 steps and tuned for its
+recommended sampler, so swapping degrades quality, which shows up as drift.
+
+Full 4-way (v19/v23 x euler_ancestral/euler) in `client/battery/`. Best configuration is
+**v23 + euler_ancestral**, which is what we started with.
+
+<details><summary>original reasoning, kept for the record</summary>
 
 `euler_ancestral` **injects fresh noise at every step**, which directly fights latent
 preservation: you keep 85% of the source at denoise 0.15 and the sampler re-randomises
@@ -70,8 +84,7 @@ from partial denoise.
 
 - Cost: one env var, ~5 min
 - Test: `docker run ... -e SAMPLER=euler`, repeat the denoise sweep, compare gradation
-- If it works: expose `sampler`/`scheduler` per-request in `EditRequest` so it can be
-  chosen per edit rather than per server
+</details>
 
 ## 2. Masked / inpaint editing  — the real missing capability
 
@@ -155,6 +168,24 @@ and the composites drift — reintroducing the exact failure this check is meant
 
 ## Also queued
 
+**v19 evaluated 2026-08-25 — v23 is better, stay on it.** v19's noise floor is higher
+(12.41/12.17 vs 9.05/7.46 face) and it is worse on identity_large. The author's "best for
+consistency in edits" appears to mean consistency of applying an edit, not fidelity to
+the source. Visually the two are hard to tell apart; the gap matters only because micro
+edits live at the floor.
+
+**Base Qwen-Image-Edit-2511 download: NOT worth it.** The hypothesis was that baked LoRAs
+cause the drift, but v19 and v23 carry different LoRA mixes and both floor at 9-12. That
+points at whole-frame regeneration itself rather than any particular merge, so ~20GB would
+likely buy the same answer.
+
+**Four levers now ruled out for micro edits:** checkpoint version, sampler, denoise, and
+step count. Each moves the floor by a point or two where a micro edit needs it near zero.
+Face mode (items 2/3) is not the preferred approach, it is the only one that can work —
+compositing makes the untouched region bit-identical, which is categorically different
+from a model choosing to leave it alone.
+
+<details><summary>superseded: original v19 note</summary>
 **AIO v19 evaluation.** Downloading `v19/Qwen-Rapid-AIO-NSFW-v19.safetensors` (28.43 GB).
 The author's note: *"v19 is likely best for consistency in edits, while v23 is likely
 best for prompt adherence."* Consistency is what we want. Note v19 recommends
@@ -163,6 +194,7 @@ applies to it too.
 
 Switch with `-e CKPT_NAME=Qwen-Rapid-AIO-NSFW-v19.safetensors` once `extra_model_paths`
 covers `qwen/v19/`; no rebuild needed.
+</details>
 
 **Base Qwen-Image-Edit-2511 in fp8** (`xms991/Qwen-Image-Edit-2511-fp8-e4m3fn` or
 `armychimp/Qwen-Image-Edit-2511-FP8`, ~20 GB) — only if 1-3 and v19 all fail. It would
