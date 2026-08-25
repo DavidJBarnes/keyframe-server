@@ -110,6 +110,49 @@ Crop the face at native resolution, edit it as a standalone square, paste back.
 
 ---
 
+## Decisions (David, 2026-08-25)
+
+**Response contract: finished result only.** `mode: face` returns the composited
+full-size image and nothing else — no crop, no box. A rejected result is just a retry
+with a new seed, which the stateless design already handles.
+
+**Rename `/edit` -> `/generate`.** `/edit` was named to mirror fal's endpoint so the
+client could target either; that rationale is gone and the server does considerably more
+than "edit". `/generate` says what comes out. Migration is free: add `/generate` as
+canonical, keep `/edit` as a deprecated alias hitting the same handler, drop the alias
+once the web app is the only caller.
+
+---
+
+## 4. Storyboard coherence check  — quality gate before spending GPU on LTX
+
+The wolf shot failed because its keyframes disagreed with each other, and that was only
+discovered *after* the render. A check that scores agreement across a set of keyframes
+would catch it beforehand. Every piece already exists:
+
+- **identity agreement** — ArcFace cosine to the anchor frame. Run on the richmond
+  keyframes it gave 0.941 / 0.838 / 0.804; the spread flagged real drift
+  (`docs/pipeline-notes.md` section 5)
+- **framing consistency** — face-box width and centre across frames. Exactly what killed
+  the wolf shot: 5.5% face area on the opener vs 2.4% on the rest, which made LTX invent
+  a camera move
+- **face pixel budget** — the >=180px threshold from the notes, predicting whether output
+  will read soft
+- **dimension/aspect uniformity** — trivial, and would have caught the hailey drift
+
+Shape: an endpoint taking N image URLs, returning per-frame scores and a verdict, so the
+web app can say "frame 3 disagrees" before anyone renders.
+
+The interesting part is what it does with the answer. Reporting is easy; acting on it is
+where the value is — "frame 3 is off-identity, regenerate it from the anchor" is the loop
+that would have saved the wolf shot.
+
+Related open question: if the web app assembles several keyframes from one source, face
+detection should run ONCE and the box be reused, or the crops differ slightly per frame
+and the composites drift — reintroducing the exact failure this check is meant to catch.
+
+---
+
 ## Also queued
 
 **AIO v19 evaluation.** Downloading `v19/Qwen-Rapid-AIO-NSFW-v19.safetensors` (28.43 GB).
