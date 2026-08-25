@@ -58,14 +58,14 @@ FAL_MODELS = {
     "nb2": "fal-ai/nano-banana-2/edit",
     "pro": "fal-ai/nano-banana-pro/edit",
 }
-DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8189/edit")
+DEFAULT_SERVER = os.environ.get("QWEN_EDIT_URL", "http://localhost:8189/generate")
 
 # Named local backends, so the common hosts don't need --server spelled out.
 # "3090" is the GPU box: the edit server listens on 8189 there because 8188 is
 # already ComfyUI. Nothing serves port 80 on that host, so the port is required.
 SERVERS = {
     "local": DEFAULT_SERVER,
-    "3090": os.environ.get("QWEN_EDIT_URL_3090", "http://3090.zero:8189/edit"),
+    "3090": os.environ.get("QWEN_EDIT_URL_3090", "http://3090.zero:8189/generate"),
     # RunPod pod IDs change every launch, so there is no sensible built-in default;
     # it must come from the environment or --server.
     "runpod": os.environ.get("QWEN_EDIT_URL_RUNPOD", ""),
@@ -199,6 +199,14 @@ def main():
                     help="sampling steps (local only). Default: let the server decide — "
                          "4 when its Lightning LoRA is active, 40 when it is not. Only "
                          "override when you know which the server resolved.")
+    ap.add_argument("--mode", choices=["full", "face"], default="full",
+                    help="full: regenerate the whole frame (default). "
+                         "face: edit only the detected face region and composite it "
+                         "back — everything outside the crop is copied verbatim and "
+                         "cannot drift.")
+    ap.add_argument("--face-pad", type=float, default=None, metavar="F",
+                    help="face mode: expand the detected face box by this factor "
+                         "before cropping (server default 1.6)")
     ap.add_argument("--denoise", type=float, default=None, metavar="F",
                     help="0<F<=1 (local only). Below 1.0 sampling starts from the source "
                          "image instead of noise, so only part of it is redrawn: ~0.2-0.4 "
@@ -231,7 +239,12 @@ def main():
             path = Path(src)
             if not path.exists():
                 sys.exit(f"input not found: {src}")
-            if args.size:
+            if args.size and args.mode == "face":
+                # Face mode composites into the original and returns its exact
+                # dimensions, so the server needs the full frame — pre-cropping
+                # here would change what gets restored around the face.
+                image_urls.append(to_data_uri(path))
+            elif args.size:
                 # Match the condition image to the requested aspect BEFORE sending.
                 # Generating a 2:3 latent from a 4:5 condition makes the model
                 # recompose to fit the new frame rather than edit in place, and it
@@ -269,6 +282,9 @@ def main():
             payload["negative_prompt"] = args.negative
         if args.denoise is not None:
             payload["denoise"] = args.denoise
+        payload["mode"] = args.mode
+        if args.face_pad is not None:
+            payload["face_pad"] = args.face_pad
         if args.size:
             # Generate at this size rather than only shrinking the result. Output
             # resolution drives compute directly: 0.39MP takes ~6s and 7MP takes
@@ -279,7 +295,8 @@ def main():
         # fal endpoints reject unknown keys, and pick their own sampler settings.
         for flag, val in (("--steps", args.steps), ("--cfg", args.cfg),
                           ("--seed", args.seed), ("--server", args.server),
-                          ("--api-key", args.api_key), ("--negative", args.negative)):
+                          ("--api-key", args.api_key), ("--negative", args.negative),
+                          ("--face-pad", args.face_pad)):
             if val is not None:
                 print(f"warning: {flag} is ignored by --model {args.model} (local backends only)",
                       file=sys.stderr)
@@ -295,7 +312,9 @@ def main():
     for idx, img in enumerate(images, start=1):
         data = fetch_bytes(img["url"])
         dest = out if len(images) == 1 else out.with_name(f"{out.stem}_{idx}{out.suffix}")
-        if args.size:
+        if args.size and args.mode == "face":
+            dest.write_bytes(data)      # already the source's dimensions
+        elif args.size:
             normalize(data, args.size).save(dest, "PNG")
         else:
             dest.write_bytes(data)

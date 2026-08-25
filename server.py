@@ -33,6 +33,8 @@ import sys
 import time
 import uuid
 
+import cv2
+import numpy as np
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -49,6 +51,13 @@ CFG = float(os.environ.get("CFG", "1.0"))
 # Ceiling for the auto-chosen output size. Only applies when the caller does not
 # specify width/height.
 MAX_MP = float(os.environ.get("MAX_MP", "1.2"))
+# Face mode: how far to expand the detected face box before cropping. The box
+# alone is jaw-to-brow; without context the composite seam lands mid-cheek and
+# the model has no hairline or neck to anchor against.
+FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
+# Fraction of the crop's smaller side blended at the boundary.
+FACE_FEATHER = float(os.environ.get("FACE_FEATHER", "0.12"))
+_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 BIND = ("0.0.0.0", 8189)
 
 
@@ -70,8 +79,16 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="qwen-edit-comfy", lifespan=lifespan)
 
 
-class EditRequest(BaseModel):
+class GenerateRequest(BaseModel):
     prompt: str
+    # "full": regenerate the whole frame (default, and what every edit did before
+    #         face mode existed).
+    # "face": detect the largest face in image_urls[0], edit only that region and
+    #         composite it back. Everything outside the crop is copied verbatim,
+    #         so it cannot drift — which whole-frame regeneration cannot promise:
+    #         asked to change nothing, it still moves ~9/255 per pass.
+    mode: str = Field(default="full", pattern="^(full|face)$")
+    face_pad: float | None = Field(default=None, gt=1.0, le=4.0)
     image_urls: list[str] = Field(min_length=1, max_length=3)
     num_images: int = Field(default=1, ge=1, le=4)
     seed: int | None = None
@@ -120,7 +137,53 @@ def comfy_upload(im: Image.Image) -> str:
     return r.json().get("name", name)
 
 
-def build_workflow(req: EditRequest, filenames: list[str], w: int, h: int) -> dict:
+def detect_face(im: Image.Image) -> tuple[int, int, int, int]:
+    """Largest frontal face as (x, y, w, h). Raises 422 if none found."""
+    arr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2GRAY)
+    faces = sorted(_CASCADE.detectMultiScale(arr, 1.05, 5), key=lambda b: -b[2] * b[3])
+    if not len(faces):
+        # Deliberately an error rather than a silent fall back to full mode:
+        # quietly doing something different is how a caller ends up debugging
+        # the wrong thing later.
+        raise HTTPException(422, "mode=face: no face detected in the first image")
+    return tuple(int(v) for v in faces[0])
+
+
+def face_crop_box(im: Image.Image, pad: float) -> tuple[int, int, int, int]:
+    """Face box expanded by `pad` and clamped to the image."""
+    x, y, w, h = detect_face(im)
+    cx, cy = x + w / 2, y + h / 2
+    half = max(w, h) * pad / 2
+    x0, y0 = int(max(0, cx - half)), int(max(0, cy - half))
+    x1, y1 = int(min(im.width, cx + half)), int(min(im.height, cy + half))
+    return x0, y0, x1, y1
+
+
+def composite_face(original: Image.Image, edited: Image.Image,
+                   box: tuple[int, int, int, int], feather: float) -> Image.Image:
+    """Blend `edited` back into `original` over `box` with a feathered edge.
+
+    A hard paste shows a visible rectangle even when the content matches, because
+    the model shifts tone slightly across the whole crop. Feathering trades a thin
+    band of blended pixels for an invisible join.
+    """
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    edited = edited.resize((bw, bh), Image.LANCZOS)
+
+    r = max(1, int(min(bw, bh) * feather))
+    mask = np.zeros((bh, bw), np.float32)
+    mask[r:bh - r, r:bw - r] = 1.0
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=r / 2.0, sigmaY=r / 2.0)
+
+    base = np.array(original).astype(np.float32)
+    patch = np.array(edited).astype(np.float32)
+    region = base[y0:y1, x0:x1]
+    base[y0:y1, x0:x1] = region * (1 - mask[..., None]) + patch * mask[..., None]
+    return Image.fromarray(np.clip(base, 0, 255).astype(np.uint8))
+
+
+def build_workflow(req: GenerateRequest, filenames: list[str], w: int, h: int) -> dict:
     """ComfyUI API-format graph, wired as Phr00t's reference workflow."""
     steps = req.num_inference_steps or STEPS
     cfg = req.true_cfg_scale if req.true_cfg_scale is not None else CFG
@@ -197,17 +260,43 @@ def fetch_output(desc: dict) -> bytes:
     return r.content
 
 
-@app.post("/edit")
-def edit(req: EditRequest):
+@app.post("/generate")
+def generate(req: GenerateRequest):
     t0 = time.time()
     rid = uuid.uuid4().hex[:8]
     images = [decode_image(u) for u in req.image_urls]
     t_decode = time.time() - t0
 
+    # --- face mode: work on a crop, restore the rest verbatim -----------------
+    #
+    # Only the FIRST image is cropped: it is the frame being edited. Any further
+    # references are passed through whole, since they usually say what something
+    # should look like rather than which pixels to change. A caller wanting a
+    # cropped reference can crop it itself.
+    face_box = None
+    original = None
+    if req.mode == "face":
+        original = images[0]
+        pad = req.face_pad if req.face_pad is not None else FACE_PAD
+        face_box = face_crop_box(original, pad)
+        x0, y0, x1, y1 = face_box
+        images[0] = original.crop(face_box)
+        print(f"[{rid}] face mode: box {x0},{y0}-{x1},{y1} "
+              f"({x1 - x0}x{y1 - y0}) from {original.width}x{original.height}", flush=True)
+
     # Latent defaults to the first input's size, but capped: compute scales with
     # output pixels (0.39MP ~6s, 1.55MP ~21s, 7.09MP ~186s), and a phone photo
     # fed in raw is ~7MP. Aspect ratio is preserved; explicit width/height wins.
-    if req.width and req.height:
+    if face_box is not None:
+        # Generate at the crop's own size, capped, so the composite is a
+        # like-for-like replacement. Caller width/height describe the final
+        # frame, which face mode preserves by construction.
+        w, h = images[0].width, images[0].height
+        mp = (w * h) / 1e6
+        if mp > MAX_MP:
+            scale = (MAX_MP / mp) ** 0.5
+            w, h = int(w * scale), int(h * scale)
+    elif req.width and req.height:
         w, h = req.width, req.height
     else:
         w, h = images[0].width, images[0].height
@@ -227,7 +316,7 @@ def edit(req: EditRequest):
         print(f"[edit] denoise<1: resized source to {w}x{h} to match the latent", flush=True)
 
     srcs = " ".join(f"{im.width}x{im.height}" for im in images)
-    print(f"[{rid}] in {len(images)} img ({srcs}) -> out {w}x{h} | "
+    print(f"[{rid}] mode={req.mode} in {len(images)} img ({srcs}) -> out {w}x{h} | "
           f"steps={req.num_inference_steps or STEPS} "
           f"cfg={req.true_cfg_scale if req.true_cfg_scale is not None else CFG} "
           f"denoise={req.denoise if req.denoise is not None else 1.0} "
@@ -244,14 +333,19 @@ def edit(req: EditRequest):
     t_run = time.time() - t2
 
     t3 = time.time()
+    results = [Image.open(io.BytesIO(fetch_output(o))).convert("RGB") for o in outs]
+    if face_box is not None:
+        feather = FACE_FEATHER
+        results = [composite_face(original, r, face_box, feather) for r in results]
+
     payload = {
         "images": [
             {
-                "url": encode_image(Image.open(io.BytesIO(fetch_output(o))).convert("RGB")),
+                "url": encode_image(im),
                 "content_type": "image/png",
                 "file_name": f"{uuid.uuid4().hex}.png",
             }
-            for o in outs
+            for im in results
         ],
         "description": "",
     }

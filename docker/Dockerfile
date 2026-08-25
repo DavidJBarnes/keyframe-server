@@ -38,7 +38,10 @@ ADD https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO/resolve/main/fixed-t
     /app/fixed_nodes_qwen.py
 
 # Adapter deps (ComfyUI already brings torch/pillow/requests)
-RUN pip install --no-cache-dir "fastapi==0.141.1" "uvicorn==0.52.4"
+# opencv and numpy come in via ComfyUI, but face mode depends on them directly —
+# pin them here so a ComfyUI dependency change cannot silently remove detection.
+RUN pip install --no-cache-dir "fastapi==0.141.1" "uvicorn==0.52.4" \
+        "opencv-python-headless" "numpy"
 
 ENV COMFY_URL=http://127.0.0.1:8188 \
     CKPT_NAME=Qwen-Rapid-AIO-NSFW-v23.safetensors \
