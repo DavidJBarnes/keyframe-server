@@ -2,16 +2,24 @@
 
 Open work on making small, controlled facial adjustments while preserving identity.
 
-**Primary use case (David, 2026-08-25): micro adjustments, mostly to the face — not
-big scene changes.** That inverts the priorities below: whole-frame regeneration is the
-wrong architecture for it. Every edit currently redraws all 832x1040 pixels to change
+**Two distinct modes are wanted (David, 2026-08-25), and they need different
+machinery:**
+
+* **Whole-scene / fundamental changes — already working well.** Garment swaps, reframes,
+  posture changes, multi-reference composition. Keep this path as-is; it is the one the
+  LTX keyframe workflow depends on and it is fast (~6-12s) and identity-faithful at
+  native aspect. Nothing below should regress it.
+* **Micro adjustments, mostly facial — the gap.** This is what the items below address.
+
+Whole-frame regeneration is the wrong architecture for the *second* mode. Every edit currently redraws all 832x1040 pixels to change
 something occupying ~4% of them, which is why control is poor and why unrelated parts of
 the image are free to drift. **Localised editing (items 2 and 3) is the approach, not the
 fallback**, and it also makes the checkpoint choice far less important — v19 vs v23 vs
 base 2511 matters when rebuilding a scene, much less when handed a tight face crop.
 
-Suggested order given that: **3, then 2, then 1** (1 stays cheap and worth trying at any
-point).
+Suggested order for the facial work: **3, then 2, then 1** (1 stays cheap and worth
+trying at any point). All three are *additive* — a face-crop path or a mask parameter
+sits alongside the existing whole-frame endpoint rather than replacing it.
 
 **Context.** Identity preservation is solid (that was an aspect-ratio bug, since fixed).
 What does not work is *controlling the magnitude* of a facial change. `--denoise` was
