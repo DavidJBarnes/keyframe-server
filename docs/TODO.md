@@ -21,6 +21,32 @@ Suggested order for the facial work: **3, then 2, then 1** (1 stays cheap and wo
 trying at any point). All three are *additive* — a face-crop path or a mask parameter
 sits alongside the existing whole-frame endpoint rather than replacing it.
 
+**These belong SERVER-side, not in the client (David, 2026-08-25).** The CLI is a
+stepping stone: the real consumer will be a web app making a series of calls to assemble
+a storyboard for LTX. Any image logic that lives in `client.py` would have to be
+reimplemented by every future caller and would drift. The server owns the capability and
+clients stay thin.
+
+That reframes what this service is: not a wrapper around ComfyUI, but **the keyframe
+service** — it knows how to produce a conditioning frame, whatever that takes internally.
+
+API shape:
+
+```
+POST /edit { "mode": "full" | "face", "prompt": ..., "image_urls": [...],
+             "face_pad": 1.6, "seed": ..., "denoise": ... }
+```
+
+`mode: face` detects the largest face in image_urls[0], crops with padding, edits the
+crop, then composites back — returning an image of the ORIGINAL dimensions. `mode: full`
+is today's behaviour, unchanged.
+
+Face detection has to run inside the container. OpenCV cascades are free (ComfyUI already
+pulls opencv) but unreliable on angled or occluded faces, which the wolf and hailey
+sources are full of. insightface buffalo_l is much better and the weights already exist on
+the box at ~/.insightface from the FaceFusion work. Start with OpenCV; return the detected
+box in the response so failures are visible rather than mysterious.
+
 **Context.** Identity preservation is solid (that was an aspect-ratio bug, since fixed).
 What does not work is *controlling the magnitude* of a facial change. `--denoise` was
 added for this and barely moves the needle: at 4 steps, denoise 0.15 changes ~74% as
@@ -68,8 +94,10 @@ the model attends to. That alone may explain why facial instructions barely regi
 
 Crop the face at native resolution, edit it as a standalone square, paste back.
 
-- Cost: client-side, no server change
-- Risk: seams at the composite boundary; may need feathering
+- Cost: server-side (see the architecture note above); client passes `mode` through
+- Risk: seams at the composite boundary; may need feathering. Colour drift between the
+  edited crop and the original is the subtler risk — a tonal edge reads worse than a
+  geometric one. Histogram-match the boundary ring if it shows up.
 - Pairs naturally with the FaceFusion post-pass already documented in
   `docs/pipeline-notes.md`
 - Face detection is already available: OpenCV cascades locally, and insightface
