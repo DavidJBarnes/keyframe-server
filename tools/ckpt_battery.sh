@@ -17,6 +17,17 @@ mkdir -p "$OUT"
 PY=${PY:-python}
 SEED=4242
 
+# Face source for the micro cases. richmond/kf1.png is a real photograph already
+# normalised to 512x768 with the face at ~19% of frame. Override with FACE=... if
+# it is missing — inputs/ is gitignored, so fixtures can vanish.
+FACE="${FACE:-inputs/richmond/kf1.png}"
+if [ ! -f "$FACE" ]; then
+    echo "  face source not found: $FACE" >&2
+    echo "  set FACE=<path to a 512x768 portrait> and rerun" >&2
+    exit 1
+fi
+echo "  face source: $FACE"
+
 run() {
     local name="$1"; shift
     local t0=$(date +%s)
@@ -36,15 +47,15 @@ run macro_scene     -i inputs/pour/pour1.png \
     -p "Change the background to a sunlit garden patio. Keep her and her clothing identical."
 
 # --- MICRO: small facial changes (the gap we are measuring) ---
-run micro_smile     -i inputs/test/k2_crop.png \
+run micro_smile     -i $FACE \
     -p "Make her smile slightly wider. Keep her face, hair, clothing and background otherwise identical."
-run micro_eyes      -i inputs/test/k2_crop.png \
+run micro_eyes      -i $FACE \
     -p "Open her eyes slightly wider. Keep everything else identical."
-run micro_none      -i inputs/test/k2_crop.png \
+run micro_none      -i $FACE \
     -p "Keep this photograph exactly as it is. Change nothing."
 
 # --- IDENTITY: does the person survive a large edit ---
-run identity_large  -i inputs/test/k2_crop.png \
+run identity_large  -i $FACE \
     -p "Change her top to a teal bikini top. Keep her face, hair and the background exactly the same."
 
 # --- MULTI-REF: the mechanism the keyframe workflow depends on ---

@@ -14,21 +14,25 @@ The `micro_none` case is the noise floor: it asks for no change at all, so its
 drift is how much the checkpoint alters an image unbidden. A checkpoint whose
 floor is comparable to its micro-edit drift cannot do micro edits.
 """
+import os
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+# Must match ckpt_battery.sh's default; override with FACE=... in both.
+FACE = os.environ.get("FACE", "inputs/richmond/kf1.png")
+
 # case -> source image it should be compared against
 SOURCES = {
     "macro_garment": "inputs/pour/pour1.png",
     "macro_colour": "inputs/pour/pour1.png",
     "macro_scene": "inputs/pour/pour1.png",
-    "micro_smile": "inputs/test/k2_crop.png",
-    "micro_eyes": "inputs/test/k2_crop.png",
-    "micro_none": "inputs/test/k2_crop.png",
-    "identity_large": "inputs/test/k2_crop.png",
+    "micro_smile": FACE,
+    "micro_eyes": FACE,
+    "micro_none": FACE,
+    "identity_large": FACE,
     "multiref": "inputs/richmond/kf1.png",
 }
 CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -56,7 +60,7 @@ def score(src_path: Path, out_path: Path):
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         sys.exit(__doc__)
     dirs = [Path(a) for a in sys.argv[1:]]
     client = Path(__file__).resolve().parent.parent / "client"
