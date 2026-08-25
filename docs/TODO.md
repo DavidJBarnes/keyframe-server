@@ -2,6 +2,17 @@
 
 Open work on making small, controlled facial adjustments while preserving identity.
 
+**Primary use case (David, 2026-08-25): micro adjustments, mostly to the face — not
+big scene changes.** That inverts the priorities below: whole-frame regeneration is the
+wrong architecture for it. Every edit currently redraws all 832x1040 pixels to change
+something occupying ~4% of them, which is why control is poor and why unrelated parts of
+the image are free to drift. **Localised editing (items 2 and 3) is the approach, not the
+fallback**, and it also makes the checkpoint choice far less important — v19 vs v23 vs
+base 2511 matters when rebuilding a scene, much less when handed a tight face crop.
+
+Suggested order given that: **3, then 2, then 1** (1 stays cheap and worth trying at any
+point).
+
 **Context.** Identity preservation is solid (that was an aspect-ratio bug, since fixed).
 What does not work is *controlling the magnitude* of a facial change. `--denoise` was
 added for this and barely moves the needle: at 4 steps, denoise 0.15 changes ~74% as
@@ -42,7 +53,7 @@ ComfyUI has the nodes (`VAEEncodeForInpaint`, `SetLatentNoiseMask`); the graph i
   (insightface is already on the box for the FaceFusion work)
 - This is what would give genuine facial control
 
-## 3. Crop-to-face, edit, composite back  — cheaper than masking, maybe better
+## 3. Crop-to-face, edit, composite back  — START HERE for micro facial edits
 
 In the test source the face is 184px of an 832x1040 image — about **4% of the pixels**
 the model attends to. That alone may explain why facial instructions barely register.
@@ -53,6 +64,13 @@ Crop the face at native resolution, edit it as a standalone square, paste back.
 - Risk: seams at the composite boundary; may need feathering
 - Pairs naturally with the FaceFusion post-pass already documented in
   `docs/pipeline-notes.md`
+- Face detection is already available: OpenCV cascades locally, and insightface
+  (buffalo_l) on the 3090 from the FaceFusion work — the same code used for the
+  face-pixel-budget measurements
+- Sketch: detect face box -> expand ~40% for context -> crop -> edit at 512x512 ->
+  resize back -> feathered alpha composite into the original. Nothing outside the
+  box is ever regenerated, so drift is structurally impossible rather than merely
+  discouraged.
 
 ---
 
