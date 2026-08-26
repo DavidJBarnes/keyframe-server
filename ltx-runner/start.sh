@@ -28,8 +28,12 @@ if [ ! -x venv/bin/python ]; then
     python3 -m venv venv && ./venv/bin/pip -q install -r requirements.txt
 fi
 
+# tee, not a plain redirect: tmux scrollback is volatile and dies with the
+# session, so a restart used to take every service-level log line with it. This
+# keeps the session attachable AND leaves runner.log on disk.
 tmux new-session -d -s "$SESSION" \
-    "./venv/bin/python app.py --host 0.0.0.0 --port ${PORT} --public-base ${PUBLIC_BASE}; \
+    "./venv/bin/python app.py --host 0.0.0.0 --port ${PORT} --public-base ${PUBLIC_BASE} 2>&1 \
+       | tee -a runner.log; \
      echo; echo '--- runner exited, shell kept so the traceback stays readable ---'; exec bash"
 
 sleep 3
