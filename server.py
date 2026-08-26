@@ -65,6 +65,18 @@ FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
 DETAIL_LO = float(os.environ.get("DETAIL_LO", "10.0"))
 DETAIL_HI = float(os.environ.get("DETAIL_HI", "35.0"))
 DETAIL_BLUR = float(os.environ.get("DETAIL_BLUR", "2.0"))
+# Radius of the alpha max-pool, as a fraction of the width of the region the
+# warp actually changed. The blend below is position-aligned, so it is only
+# valid where LivePortrait left the pixel where it found it. Difference
+# magnitude cannot establish that: skin sliding over skin is a large
+# displacement with a small |edited - source|, so it lands mid-ramp and
+# composites two misaligned copies of the same feature at ~50/50 — the doubled
+# brows and lids that show up on every rotate_* axis. Max-pooling alpha before
+# the blur means a neighbourhood containing any motion is taken wholly from the
+# warp. Measured on rotate_pitch 8: pixels in the 0.15-0.85 ghost band where
+# that doubling lives fall 47.5% -> 9.7%. Swept by eye at 0.055/0.08/0.11/0.15
+# on three faces: 0.055 still doubles a lip, above 0.08 only costs texture.
+DETAIL_DILATE = float(os.environ.get("DETAIL_DILATE", "0.08"))
 # Unsharp amount applied inside the warp region before blending. OFF by default:
 # on real footage it reads as processed and crunchy rather than sharp, which is
 # worse than the softness it was meant to fix. The measured texture gain was real
@@ -319,9 +331,30 @@ def detect_face(im: Image.Image) -> tuple[int, int, int, int]:
     return tuple(int(v) for v in faces[0])
 
 
+def whole_face_motion(exp: "Expression", src_ratio: float,
+                      sample_ratio: float, sample_parts: str,
+                      has_driver: bool) -> float:
+    """0-1: how much of the face this edit displaces as a rigid body.
+
+    Read off the request rather than estimated from |edited - source|. Difference
+    magnitude is contrast-dependent and the estimate collapses on smooth skin:
+    the same 12-degree turn put 25% of the face above the ramp on a high-contrast
+    subject and 7% on a soft-lit one, so a pixel-derived radius left the second
+    face fully ghosted. The requested angles are exact and free.
+    """
+    m = max(abs(exp.rotate_pitch), abs(exp.rotate_yaw),
+            abs(exp.rotate_roll)) / 8.0          # saturate at 8 degrees on any axis
+    # A driver carrying rotation, and relaxing the resting expression, both move
+    # the whole face without any rotate_* axis being set.
+    if has_driver and sample_parts in ("OnlyRotation", "All"):
+        m = max(m, abs(sample_ratio))
+    return min(1.0, max(m, 1.0 - src_ratio))
+
+
 def restore_detail(source: Image.Image, edited: Image.Image,
                    strength: float = 1.0,
-                   sharpen: float = DETAIL_SHARPEN) -> Image.Image:
+                   sharpen: float = DETAIL_SHARPEN,
+                   motion: float = 1.0) -> Image.Image:
     """Take the source's pixels back wherever LivePortrait did not move anything.
 
     The node's decoder softens the whole face crop uniformly, but an expression
@@ -329,6 +362,12 @@ def restore_detail(source: Image.Image, edited: Image.Image,
     on |edited - source| keeps the edit where it happened and the original
     texture everywhere else, which measured 16% -> 31% of source texture with no
     visible seam. Alpha is blurred so the handover has no hard edges.
+
+    The blend is position-aligned, so it is only correct where the warp left the
+    pixel in place, and |edited - source| does not establish that on its own —
+    see DETAIL_DILATE. Alpha is max-pooled before it is blurred so that anything
+    near real motion is taken wholly from the warp, and only genuinely still
+    regions fall back to the source.
 
     Not a sharpening filter and not a restoration model: every pixel here comes
     from one of the two real images, so it cannot invent detail or alter age.
@@ -347,12 +386,51 @@ def restore_detail(source: Image.Image, edited: Image.Image,
     # the frame touched, against 0.0000 and 13% when ordered correctly.
     d = np.abs(e - s).mean(2)
     a = np.clip((d - DETAIL_LO) / max(1e-6, DETAIL_HI - DETAIL_LO), 0, 1)
-    a = cv2.GaussianBlur(a, (0, 0), DETAIL_BLUR)[..., None]
+
+    # Scale the max-pool to how far the warp actually reached, as face size x
+    # how much of the face moved.
+    #
+    # Face size comes from the node's own composite mask (everything outside it
+    # is bit-identical, so d is exactly 0 there). That is contrast-free, which
+    # |edited - source| is not — sizing the radius off the change map alone gave
+    # a low-contrast face a third of the radius of a high-contrast one under the
+    # identical edit. It also describes the face the node chose to warp, which
+    # on a multi-face frame is not the one detect_face found (ours picks the
+    # largest, the node's picks the centre-most).
+    #
+    # The second factor is what separates a smile from a head turn: a mouth edit
+    # moves a few percent of the face and needs almost no max-pool, while a
+    # rotation moves all of it and needs the full radius. Saturating at a
+    # quarter keeps a partial edit from being treated as a whole-head move.
+    # Face size from the node's own composite mask — everything outside it is
+    # bit-identical, so d is exactly 0 there. Contrast-free, and it describes the
+    # face the node chose to warp, which on a multi-face frame is not the one
+    # detect_face found (ours picks the largest, the node's the centre-most).
+    mask = d > 0
+    r = max(3, int(DETAIL_DILATE * np.sqrt(mask.sum()) * motion))
+
+    # Only the confidently-moved core is grown, and it is opened first. A
+    # max-pool amplifies whatever it touches, and the decoder's uniform
+    # softening leaves single pixels scattered over the whole face just above
+    # the ramp; dilating those directly merges the speckle into a sheet and
+    # softens the forehead on a smile — a third of the restored texture, on the
+    # case that was never broken. Gaussian blur had averaged them away.
+    core = (a > 0.5).astype(np.float32)
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    core = cv2.GaussianBlur(core, (0, 0), max(DETAIL_BLUR, r / 4.0))
+    a = np.maximum(a, core)[..., None]
     a = 1.0 - (1.0 - a) * strength      # strength<1 keeps more of the node's output
 
     if sharpen > 0:
+        # Confined to the node's own composite mask (everything outside it is
+        # bit-identical, so d is exactly 0 there). The max-pool above pushes
+        # alpha past that boundary, and an unconfined sharpen would then drift
+        # pixels the node had deliberately left untouched.
         blurred = cv2.GaussianBlur(e, (0, 0), 1.2)
-        e = np.clip(e + (e - blurred) * sharpen, 0, 255)
+        e = np.where((d > 0)[..., None],
+                     np.clip(e + (e - blurred) * sharpen, 0, 255), e)
 
     # Where alpha is 0 this returns the source byte-for-byte, whatever sharpen is.
     return Image.fromarray(np.clip(s * (1 - a) + e * a, 0, 255).astype(np.uint8))
@@ -525,7 +603,9 @@ def generate(req: GenerateRequest):
         results = [Image.open(io.BytesIO(fetch_output(o))).convert("RGB") for o in outs]
         if req.detail_restore > 0:
             sharpen = req.detail_sharpen if req.detail_sharpen is not None else DETAIL_SHARPEN
-            results = [restore_detail(images[0], r, req.detail_restore, sharpen)
+            motion = whole_face_motion(exp, req.src_ratio, req.sample_ratio,
+                                       req.sample_parts, len(images) > 1)
+            results = [restore_detail(images[0], r, req.detail_restore, sharpen, motion)
                        for r in results]
         return _respond(rid, t0, results, outs, t_decode, t_upload, t_run, time.time() - t3)
 
