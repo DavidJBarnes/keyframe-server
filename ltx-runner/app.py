@@ -25,11 +25,10 @@ LTX does not fail gracefully, it dies mid-load.
 """
 import argparse
 import base64
-import io
+import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import threading
 import time
