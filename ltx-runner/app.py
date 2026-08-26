@@ -216,6 +216,17 @@ def lora_coverage(lora: Path, transformer: Path) -> tuple[int, int]:
     return len(affected & _transformer_keys(transformer)), len(affected)
 
 
+def lora_base_model(lora: Path) -> str | None:
+    """What the LoRA file says it was trained against, if it says anything.
+
+    Trainers record this inconsistently -- `ss_sd_model_name`, `ss_base_model_version`,
+    or nothing at all -- so absence proves nothing and this is advisory only.
+    """
+    with safe_open(str(lora), framework="pt") as f:
+        meta = f.metadata() or {}
+    return meta.get("ss_sd_model_name") or meta.get("ss_base_model_version")
+
+
 def resolve_lora(name: str) -> Path:
     """A filename inside LORA_DIR, never a path.
 
@@ -487,6 +498,18 @@ def submit(req: JobRequest):
         if hit < total:
             print(f"[warn] lora {lo.name} fuses {hit}/{total} weights "
                   f"({100 * hit / total:.0f}%) -- partial match", flush=True)
+        # Every LoRA on this box records a 2.3-era base while the transformers
+        # here are 2.5. The shapes line up, so it fuses cleanly and silently --
+        # it is a delta trained against different weights, which is tolerable at
+        # low strength and destructive at high. Measured the hard way: the same
+        # LoRA that produced good video at 0.6 produced unusable output at 1.0.
+        base = lora_base_model(resolve_lora(lo.name))
+        if base and "2.5" not in base and lo.strength > 0.7:
+            raise HTTPException(422,
+                f"lora {lo.name!r} records base model {base!r} but this is LTX 2.5, "
+                f"and strength {lo.strength} is high for a cross-version LoRA. It will "
+                f"fuse cleanly and degrade the model rather than fail. 0.6 or lower is "
+                f"the range that has actually produced good output here.")
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
@@ -529,6 +552,7 @@ def loras():
     return {"dir": str(LORA_DIR),
             "loras": sorted(
                 ({"name": f.name, "size_gb": round(f.stat().st_size / 1e9, 2),
+                  "base_model": lora_base_model(f),
                   **dict(zip(("fused", "targeted"),
                              lora_coverage(f, MODELS / DISTILLED_T)))}
                  for f in LORA_DIR.glob("*.safetensors")),
