@@ -62,9 +62,16 @@ FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
 # crop_factor cannot fix it (the node clamps to 1.5-2.5, and 1.5 is already the
 # sharp end). These thresholds ramp the handover on |output - source|: below LO
 # the node changed nothing worth keeping, so the source pixel wins.
-DETAIL_LO = float(os.environ.get("DETAIL_LO", "6.0"))
-DETAIL_HI = float(os.environ.get("DETAIL_HI", "22.0"))
+DETAIL_LO = float(os.environ.get("DETAIL_LO", "10.0"))
+DETAIL_HI = float(os.environ.get("DETAIL_HI", "35.0"))
 DETAIL_BLUR = float(os.environ.get("DETAIL_BLUR", "2.0"))
+# Unsharp amount applied to the node's output before blending. The decoder takes
+# a 256x256 input (it upsamples 2x on the way out, but the input is the ceiling),
+# so its output is a genuinely soft version of real content — re-sharpening it
+# recovers apparent detail rather than inventing structure. Measured on a face
+# edit: texture 37% -> 57% of source with the edit's magnitude down only ~15%,
+# where getting the same texture from blending alone costs ~40% of the edit.
+DETAIL_SHARPEN = float(os.environ.get("DETAIL_SHARPEN", "1.0"))
 # Fraction of the crop's smaller side blended at the boundary.
 # YuNet, a small DNN detector. OpenCV 5 dropped CascadeClassifier from the top
 # level, and YuNet is the better tool regardless: Haar cascades miss angled and
@@ -246,6 +253,8 @@ class GenerateRequest(BaseModel):
     # 1.0 restores source texture everywhere the warp did not move anything;
     # 0 returns the node's output untouched. See restore_detail().
     detail_restore: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Unsharp amount on the node's output before blending. 0 disables.
+    detail_sharpen: float | None = Field(default=None, ge=0.0, le=3.0)
     image_urls: list[str] = Field(min_length=1, max_length=3)
     num_images: int = Field(default=1, ge=1, le=4)
     seed: int | None = None
@@ -309,7 +318,8 @@ def detect_face(im: Image.Image) -> tuple[int, int, int, int]:
 
 
 def restore_detail(source: Image.Image, edited: Image.Image,
-                   strength: float = 1.0) -> Image.Image:
+                   strength: float = 1.0,
+                   sharpen: float = DETAIL_SHARPEN) -> Image.Image:
     """Take the source's pixels back wherever LivePortrait did not move anything.
 
     The node's decoder softens the whole face crop uniformly, but an expression
@@ -327,6 +337,9 @@ def restore_detail(source: Image.Image, edited: Image.Image,
     e = np.asarray(edited, np.float32)
     if s.shape != e.shape:
         return edited
+    if sharpen > 0:
+        blurred = cv2.GaussianBlur(e, (0, 0), 1.2)
+        e = np.clip(e + (e - blurred) * sharpen, 0, 255)
     d = np.abs(e - s).mean(2)
     a = np.clip((d - DETAIL_LO) / max(1e-6, DETAIL_HI - DETAIL_LO), 0, 1)
     a = cv2.GaussianBlur(a, (0, 0), DETAIL_BLUR)[..., None]
@@ -500,7 +513,9 @@ def generate(req: GenerateRequest):
         t3 = time.time()
         results = [Image.open(io.BytesIO(fetch_output(o))).convert("RGB") for o in outs]
         if req.detail_restore > 0:
-            results = [restore_detail(images[0], r, req.detail_restore) for r in results]
+            sharpen = req.detail_sharpen if req.detail_sharpen is not None else DETAIL_SHARPEN
+            results = [restore_detail(images[0], r, req.detail_restore, sharpen)
+                       for r in results]
         return _respond(rid, t0, results, outs, t_decode, t_upload, t_run, time.time() - t3)
 
     face_box = None

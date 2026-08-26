@@ -145,6 +145,19 @@ Also: `face_pad` (crop_factor, 1.5–2.5 — how much context the warp sees; low
 sharper), `src_ratio` (below 1.0 relaxes the resting expression toward neutral
 first), and `detail_restore` (0–1, default 1.0).
 
+**Why face edits look soft, and what helps.** LivePortrait's decoder takes a
+**256x256 input** (it upsamples 2x on the way out, but the input is the ceiling),
+so it returns a genuinely soft version of the face — raw output measures 19-33%
+of the source's skin texture. Two things claw it back, both applied by default:
+blending source pixels back wherever the warp moved nothing, and an unsharp pass
+on the node's output before that blend. Together: 19% -> 57% on a mouth edit,
+33% -> 64% on an eye edit, 30% -> 77% on a head rotation. Tune with
+`detail_restore` (0-1) and `detail_sharpen` (0-3, default 1.0); set both to 0 to
+see the raw node output.
+
+Head rotations stay the softest case and always will — they move every pixel, so
+there is nothing unchanged left to restore from.
+
 **About `detail_restore`.** LivePortrait decodes through a fixed 256×256
 bottleneck, so it softens the whole face crop — including the parts it did not
 move. Detail restoration blends on `|output − source|`, keeping the node's pixels
