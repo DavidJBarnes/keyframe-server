@@ -40,6 +40,7 @@ from pathlib import Path
 import requests
 import uvicorn
 from PIL import Image
+from safetensors import safe_open
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -138,6 +139,7 @@ class Job:
     video: str | None = None
     error: str | None = None
     placement: list[dict] = field(default_factory=list)
+    loras: list[dict] = field(default_factory=list)
     created: float = field(default_factory=time.time)
     started: float | None = None
     finished: float | None = None
@@ -150,6 +152,7 @@ class Job:
             "video": f"{base}/job/{self.id}/video" if self.status == "Done" else None,
             "placement": self.placement,
             "pipeline": self.req.pipeline,
+            "loras": self.loras,
             "queued_s": round((self.started or time.time()) - self.created, 1),
         }
         if self.started:
@@ -174,6 +177,43 @@ def decode_image(src: str, dest: Path):
         dest.write_bytes(requests.get(src, timeout=120).content)
     else:
         raise HTTPException(400, "keyframe image must be a data URI or http(s) URL")
+
+
+_TKEYS: set[str] | None = None
+
+
+def _transformer_keys(transformer: Path) -> set[str]:
+    """Weight names as the loader sees them, cached (header read, no tensors)."""
+    global _TKEYS
+    if _TKEYS is None:
+        pre = "model.diffusion_model."
+        with safe_open(str(transformer), framework="pt") as f:
+            _TKEYS = {k[len(pre):] if k.startswith(pre) else k for k in f.keys()}
+    return _TKEYS
+
+
+def lora_coverage(lora: Path, transformer: Path) -> tuple[int, int]:
+    """(fused, targeted) weights for this LoRA against this transformer.
+
+    A LoRA whose keys do not line up fuses NOTHING and says nothing about it:
+    `_affected_weight_keys` in fuse_loras.py matches purely on a
+    `.lora_A.weight` naming convention, and `apply_loras` then iterates an empty
+    set. No error, no warning, no log line -- the run looks completely normal and
+    the LoRA simply is not there. Nothing in LTX logs LoRA loading at INFO, so
+    there is otherwise no way to tell from the output of a job.
+
+    Both sides get a prefix strip at load, which is the whole subtlety: the
+    transformer loses `model.diffusion_model.` (LTXV_MODEL_COMFY_RENAMING_MAP)
+    and the LoRA loses `diffusion_model.` (LTXV_LORA_COMFY_RENAMING_MAP), and
+    they meet at `transformer_blocks.*`. Comparing the raw file keys reports 0%
+    for every LoRA, which looks like a catastrophe and is just the wrong test.
+    """
+    with safe_open(str(lora), framework="pt") as f:
+        keys = [k[len("diffusion_model."):] if k.startswith("diffusion_model.") else k
+                for k in f.keys()]
+    suffix = ".lora_A.weight"
+    affected = {k[: -len(suffix)] + ".weight" for k in keys if k.endswith(suffix)}
+    return len(affected & _transformer_keys(transformer)), len(affected)
 
 
 def resolve_lora(name: str) -> Path:
@@ -358,6 +398,15 @@ def run_job(job: Job):
                 job.placement[i]["resized"] = note
         (workdir / "prompt.txt").write_text(job.req.prompt)
 
+        for lo in job.req.loras:
+            hit, total = lora_coverage(
+                resolve_lora(lo.name),
+                MODELS / (DEV_T if job.req.pipeline == "hq" else DISTILLED_T))
+            job.loras.append({"name": lo.name, "strength": lo.strength,
+                              "fused": hit, "targeted": total})
+            print(f"[{job.id}] lora {lo.name} @{lo.strength} -> fuses {hit}/{total} weights",
+                  flush=True)
+
         free = free_the_gpu()
         if free < MIN_FREE_GB:
             raise RuntimeError(
@@ -428,7 +477,16 @@ def submit(req: JobRequest):
                 f"transformer has a fixed schedule and no CFG, so there is nothing "
                 f"for them to steer.")
     for lo in req.loras:
-        resolve_lora(lo.name)      # fail at submit, not four minutes in
+        path = resolve_lora(lo.name)      # fail at submit, not four minutes in
+        hit, total = lora_coverage(path, MODELS / (DEV_T if req.pipeline == "hq" else DISTILLED_T))
+        if total == 0 or hit == 0:
+            raise HTTPException(422,
+                f"lora {lo.name!r} fuses into 0 of {total} weights on the "
+                f"{req.pipeline} transformer -- it would load, log nothing, and have "
+                f"no effect. Wrong LoRA format or wrong base model.")
+        if hit < total:
+            print(f"[warn] lora {lo.name} fuses {hit}/{total} weights "
+                  f"({100 * hit / total:.0f}%) -- partial match", flush=True)
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
@@ -470,7 +528,9 @@ def loras():
         return {"dir": str(LORA_DIR), "loras": []}
     return {"dir": str(LORA_DIR),
             "loras": sorted(
-                ({"name": f.name, "size_gb": round(f.stat().st_size / 1e9, 2)}
+                ({"name": f.name, "size_gb": round(f.stat().st_size / 1e9, 2),
+                  **dict(zip(("fused", "targeted"),
+                             lora_coverage(f, MODELS / DISTILLED_T)))}
                  for f in LORA_DIR.glob("*.safetensors")),
                 key=lambda x: x["name"])}
 
