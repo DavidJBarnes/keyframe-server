@@ -65,13 +65,15 @@ FACE_PAD = float(os.environ.get("FACE_PAD", "1.6"))
 DETAIL_LO = float(os.environ.get("DETAIL_LO", "10.0"))
 DETAIL_HI = float(os.environ.get("DETAIL_HI", "35.0"))
 DETAIL_BLUR = float(os.environ.get("DETAIL_BLUR", "2.0"))
-# Unsharp amount applied to the node's output before blending. The decoder takes
-# a 256x256 input (it upsamples 2x on the way out, but the input is the ceiling),
-# so its output is a genuinely soft version of real content — re-sharpening it
-# recovers apparent detail rather than inventing structure. Measured on a face
-# edit: texture 37% -> 57% of source with the edit's magnitude down only ~15%,
-# where getting the same texture from blending alone costs ~40% of the edit.
-DETAIL_SHARPEN = float(os.environ.get("DETAIL_SHARPEN", "1.0"))
+# Unsharp amount applied inside the warp region before blending. OFF by default:
+# on real footage it reads as processed and crunchy rather than sharp, which is
+# worse than the softness it was meant to fix. The measured texture gain was real
+# but the look was not, and the look is what matters.
+#
+# It remains available per-request via `detail_sharpen` for the one case that has
+# no alternative — head rotations move every pixel, so there is nothing unchanged
+# to restore from and sharpening is the only lever (texture 38% -> 68%).
+DETAIL_SHARPEN = float(os.environ.get("DETAIL_SHARPEN", "0.0"))
 # Fraction of the crop's smaller side blended at the boundary.
 # YuNet, a small DNN detector. OpenCV 5 dropped CascadeClassifier from the top
 # level, and YuNet is the better tool regardless: Haar cascades miss angled and
