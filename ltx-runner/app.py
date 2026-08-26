@@ -66,7 +66,19 @@ MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "18.0"))
 #
 # `--distilled-lora` is REQUIRED by the hq parser (args.py), so hq without a
 # LoRA is not a configuration that exists.
-PIPELINES = ("distilled", "hq")
+#   ltx23     — the 2.3 distilled monolith through distilled.py.
+#   ltx23-hq  — the 2.3 DEV monolith through ti2vid_two_stages_hq with 2.3's own
+#               distilled LoRA at stage 2. This is the one the content LoRAs on
+#               this box are actually for: they record ss_sd_model_name
+#               "ltx-2.3-22b-dev.safetensors", and LTX's MODELS-LTX-2.3.md says
+#               to pair them with a 2.3 checkpoint.
+#
+# 2.3 ships MONOLITHS — one file carrying transformer, both VAEs and the text
+# projection — so the CLI differs from 2.5's five split paths: it takes
+# --checkpoint-path (or --distilled-checkpoint-path for distilled.py) plus
+# --gemma-root pointing at a Gemma HF directory.
+PIPELINES = ("distilled", "hq", "ltx23", "ltx23-hq")
+MODELS_23 = LTX_HOME / "models" / "ltx-2.3"
 # Content LoRAs live here, NOT under models/ltx-2.5/loras (that holds the
 # distilled LoRA the hq pipeline needs). Requests name a file in this directory
 # rather than passing a path, so a browser cannot walk the filesystem.
@@ -191,17 +203,17 @@ def safetensors_header(path: Path) -> dict:
         return json.loads(f.read(n))
 
 
-_TKEYS: set[str] | None = None
+_TKEYS: dict[str, set[str]] = {}
 
 
 def _transformer_keys(transformer: Path) -> set[str]:
     """Weight names as the loader sees them, cached (header read, no tensors)."""
-    global _TKEYS
-    if _TKEYS is None:
+    key = str(transformer)
+    if key not in _TKEYS:
         pre = "model.diffusion_model."
-        _TKEYS = {k[len(pre):] if k.startswith(pre) else k
-                  for k in safetensors_header(transformer) if k != "__metadata__"}
-    return _TKEYS
+        _TKEYS[key] = {k[len(pre):] if k.startswith(pre) else k
+                       for k in safetensors_header(transformer) if k != "__metadata__"}
+    return _TKEYS[key]
 
 
 def lora_coverage(lora: Path, transformer: Path) -> tuple[int, int]:
@@ -236,6 +248,23 @@ def lora_base_model(lora: Path) -> str | None:
     """
     meta = safetensors_header(lora).get("__metadata__") or {}
     return meta.get("ss_sd_model_name") or meta.get("ss_base_model_version")
+
+
+def recorded_version(base: str | None) -> str | None:
+    """LTX generation a LoRA claims, or None when the file does not really say.
+
+    Deliberately conservative. Only "2.3" or "2.5" appearing in the recorded base
+    counts; "ltx2" and "ltx2_v1" are era-ambiguous and two of the six files here
+    record nothing at all. Guessing from those would produce confident warnings
+    about files whose provenance is genuinely unknown, and a warning that fires
+    on unknowns is one people learn to click through.
+    """
+    if not base:
+        return None
+    for v in ("2.5", "2.3"):
+        if v in base:
+            return v
+    return None
 
 
 def resolve_lora(name: str) -> Path:
@@ -342,6 +371,40 @@ DISTILLED_T = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetenso
 DEV_T = "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
 DISTILLED_LORA = "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 
+# --- LTX 2.3 monolith layout, mirroring models/ltx-2.5/ --------------------
+T23_DEV = MODELS_23 / "diffusion_models/ltx-2.3-22b-dev.safetensors"
+T23_DISTILLED = MODELS_23 / "diffusion_models/ltx-2.3-22b-distilled-1.1.safetensors"
+GEMMA_23 = MODELS_23 / "text_encoders/gemma-3-12b-it"
+LORA_23 = MODELS_23 / "loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+UPSAMPLER_23 = MODELS_23 / "latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+
+
+def is_23(pipeline: str) -> bool:
+    return pipeline.startswith("ltx23")
+
+
+def base_transformer(pipeline: str) -> Path:
+    """The weights a LoRA would be fused into, for coverage checking."""
+    if pipeline == "ltx23":
+        return T23_DISTILLED
+    if pipeline == "ltx23-hq":
+        return T23_DEV
+    return MODELS / (DEV_T if pipeline == "hq" else DISTILLED_T)
+
+
+def require_23_assets(pipeline: str) -> None:
+    """Fail at submit with something actionable, not four minutes into a run."""
+    need = [(GEMMA_23, "Gemma text encoder directory"),
+            (UPSAMPLER_23, "2.3 spatial upsampler"),
+            (T23_DEV if pipeline == "ltx23-hq" else T23_DISTILLED, "2.3 checkpoint")]
+    if pipeline == "ltx23-hq":
+        need.append((LORA_23, "2.3 distilled LoRA (required by the hq parser)"))
+    missing = [f"{d} at {p}" for p, d in need if not p.exists()]
+    if missing:
+        raise HTTPException(503,
+            "LTX 2.3 assets are not on disk yet: " + "; ".join(missing) +
+            ". Run LTX-2/download-ltx23.sh (tmux session ltx23-dl).")
+
 
 def build_argv(job: Job, workdir: Path) -> list[str]:
     """Assemble the CLI. Both pipelines take the same core flags.
@@ -354,23 +417,38 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
     """
     py = LTX_HOME / "venv" / "bin" / "python"
     py = str(py if py.exists() else "python")
-    hq = job.req.pipeline == "hq"
+    pipe = job.req.pipeline
+    hq = pipe in ("hq", "ltx23-hq")
+    v23 = is_23(pipe)
 
     argv = [py]
     argv += (["-m", "ltx_pipelines.ti2vid_two_stages_hq"] if hq
              else ["packages/ltx-pipelines/src/ltx_pipelines/distilled.py"])
-    argv += [
-        "--transformer-path", str(MODELS / (DEV_T if hq else DISTILLED_T)),
-        "--text-encoder-path", str(MODELS / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
-        "--video-vae-path", str(MODELS / "vae/ltx-2.5-video-vae-bf16.safetensors"),
-        "--audio-vae-path", str(MODELS / "vae/ltx-2.5-audio-vae-bf16.safetensors"),
-        "--spatial-upsampler-path", str(MODELS / "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
-        "--prompt", job.req.prompt,
-    ]
+
+    if v23:
+        # Monolith: the checkpoint carries the transformer, both VAEs and the
+        # text projection, so there is nothing to pass for vae or text-encoder.
+        # distilled.py's parser names the monolith --distilled-checkpoint-path;
+        # the hq parser names it --checkpoint-path. Same file role, two flags.
+        argv += [("--checkpoint-path" if hq else "--distilled-checkpoint-path"),
+                 str(T23_DEV if hq else T23_DISTILLED),
+                 "--gemma-root", str(GEMMA_23),
+                 "--spatial-upsampler-path", str(UPSAMPLER_23)]
+    else:
+        argv += [
+            "--transformer-path", str(MODELS / (DEV_T if hq else DISTILLED_T)),
+            "--text-encoder-path", str(MODELS / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
+            "--video-vae-path", str(MODELS / "vae/ltx-2.5-video-vae-bf16.safetensors"),
+            "--audio-vae-path", str(MODELS / "vae/ltx-2.5-audio-vae-bf16.safetensors"),
+            "--spatial-upsampler-path", str(MODELS / "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
+        ]
+    argv += ["--prompt", job.req.prompt]
 
     if hq:
-        # Required by the hq parser -- hq without a LoRA is not a thing.
-        lora = ["--distilled-lora", str(MODELS / DISTILLED_LORA)]
+        # Required by the hq parser -- hq without a LoRA is not a thing. Each
+        # version brings its own; a 2.5 distilled LoRA on a 2.3 base is the very
+        # mismatch this pipeline exists to avoid.
+        lora = ["--distilled-lora", str(LORA_23 if v23 else MODELS / DISTILLED_LORA)]
         if job.req.lora_strength is not None:
             lora.append(str(job.req.lora_strength))
         argv += lora
@@ -421,9 +499,8 @@ def run_job(job: Job):
         (workdir / "prompt.txt").write_text(job.req.prompt)
 
         for lo in job.req.loras:
-            hit, total = lora_coverage(
-                resolve_lora(lo.name),
-                MODELS / (DEV_T if job.req.pipeline == "hq" else DISTILLED_T))
+            hit, total = lora_coverage(resolve_lora(lo.name),
+                                       base_transformer(job.req.pipeline))
             job.loras.append({"name": lo.name, "strength": lo.strength,
                               "fused": hit, "targeted": total})
             print(f"[{job.id}] lora {lo.name} @{lo.strength} -> fuses {hit}/{total} weights",
@@ -487,7 +564,9 @@ def submit(req: JobRequest):
                 f"pipelines accept 32. Nearest: {(v // 64) * 64} or {(v // 64 + 1) * 64}.")
     if req.pipeline not in PIPELINES:
         raise HTTPException(422, f"pipeline must be one of {PIPELINES}, got {req.pipeline!r}")
-    if req.pipeline == "distilled":
+    if is_23(req.pipeline):
+        require_23_assets(req.pipeline)
+    if req.pipeline in ("distilled", "ltx23"):
         # Silently ignoring these would be worse: a caller who sent a negative
         # prompt to steer identity drift would think it was doing something.
         unusable = [n for n, v in (("negative_prompt", req.negative_prompt),
@@ -500,7 +579,7 @@ def submit(req: JobRequest):
                 f"for them to steer.")
     for lo in req.loras:
         path = resolve_lora(lo.name)      # fail at submit, not four minutes in
-        hit, total = lora_coverage(path, MODELS / (DEV_T if req.pipeline == "hq" else DISTILLED_T))
+        hit, total = lora_coverage(path, base_transformer(req.pipeline))
         if total == 0 or hit == 0:
             raise HTTPException(422,
                 f"lora {lo.name!r} fuses into 0 of {total} weights on the "
@@ -515,12 +594,14 @@ def submit(req: JobRequest):
         # low strength and destructive at high. Measured the hard way: the same
         # LoRA that produced good video at 0.6 produced unusable output at 1.0.
         base = lora_base_model(resolve_lora(lo.name))
-        if base and "2.5" not in base and lo.strength > 0.7:
+        recorded, target = recorded_version(base), "2.3" if is_23(req.pipeline) else "2.5"
+        if recorded and recorded != target and lo.strength > 0.7:
             raise HTTPException(422,
-                f"lora {lo.name!r} records base model {base!r} but this is LTX 2.5, "
-                f"and strength {lo.strength} is high for a cross-version LoRA. It will "
-                f"fuse cleanly and degrade the model rather than fail. 0.6 or lower is "
-                f"the range that has actually produced good output here.")
+                f"lora {lo.name!r} records base model {base!r} (LTX {recorded}) but this "
+                f"pipeline is LTX {target}, and strength {lo.strength} is high for a "
+                f"cross-version LoRA. It fuses cleanly and degrades the model rather than "
+                f"failing. 0.6 or lower is the range that has produced good output here; "
+                f"pipeline 'ltx23-hq' pairs these LoRAs with the base they name.")
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
