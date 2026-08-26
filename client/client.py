@@ -224,6 +224,10 @@ def main():
                     help="mode=face: 0-1, default 1.0. Restores source skin texture "
                          "wherever the warp moved nothing. 0 returns LivePortrait's "
                          "output raw (softer)")
+    ap.add_argument("--detail-sharpen", type=float, default=None, metavar="F",
+                    help="mode=face: 0-3, default 1.0. Unsharp on LivePortrait's "
+                         "output before blending. Its decoder takes a 256px input, "
+                         "so the output is genuinely soft; 0 shows it raw")
     ap.add_argument("--src-ratio", type=float, default=None, metavar="F",
                     help="mode=face: how much of the subject's resting expression "
                          "to keep (0-1, default 1.0). Below 1 relaxes toward neutral")
@@ -332,6 +336,8 @@ def main():
             payload["src_ratio"] = args.src_ratio
         if args.detail_restore is not None:
             payload["detail_restore"] = args.detail_restore
+        if args.detail_sharpen is not None:
+            payload["detail_sharpen"] = args.detail_sharpen
         if args.size:
             # Generate at this size rather than only shrinking the result. Output
             # resolution drives compute directly: 0.39MP takes ~6s and 7MP takes

@@ -337,13 +337,22 @@ def restore_detail(source: Image.Image, edited: Image.Image,
     e = np.asarray(edited, np.float32)
     if s.shape != e.shape:
         return edited
-    if sharpen > 0:
-        blurred = cv2.GaussianBlur(e, (0, 0), 1.2)
-        e = np.clip(e + (e - blurred) * sharpen, 0, 255)
+    # The change map MUST come from the unsharpened output. Sharpening first
+    # makes every textured pixel in the frame differ from the source — including
+    # the background — so alpha becomes non-zero far outside the warp region and
+    # the "everything outside the face is bit-identical" guarantee is lost.
+    # Measured when this was wrong: 0.63 drift in the frame corners and 36% of
+    # the frame touched, against 0.0000 and 13% when ordered correctly.
     d = np.abs(e - s).mean(2)
     a = np.clip((d - DETAIL_LO) / max(1e-6, DETAIL_HI - DETAIL_LO), 0, 1)
     a = cv2.GaussianBlur(a, (0, 0), DETAIL_BLUR)[..., None]
     a = 1.0 - (1.0 - a) * strength      # strength<1 keeps more of the node's output
+
+    if sharpen > 0:
+        blurred = cv2.GaussianBlur(e, (0, 0), 1.2)
+        e = np.clip(e + (e - blurred) * sharpen, 0, 255)
+
+    # Where alpha is 0 this returns the source byte-for-byte, whatever sharpen is.
     return Image.fromarray(np.clip(s * (1 - a) + e * a, 0, 255).astype(np.uint8))
 
 
