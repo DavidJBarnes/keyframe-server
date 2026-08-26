@@ -53,6 +53,21 @@ MODELS = LTX_HOME / "models" / "ltx-2.5"
 # Free at least this much VRAM before starting, or refuse rather than OOM deep
 # in a model load twenty minutes later.
 MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "18.0"))
+# Two pipelines, both two-stage and both needing /64 dimensions.
+#
+#   distilled — ltx-2.5-22b-distilled-transformer. One model, no LoRA, no
+#               negative prompt, no step count. Fast and what run_richmond.sh
+#               used.
+#   hq        — the ltx-2.5-22b-DEV transformer with the distilled LoRA applied
+#               at stage 2. Takes a negative prompt and an explicit step count,
+#               which is the whole reason to reach for it: the distilled model
+#               gives you no lever against identity drift, and --negative-prompt
+#               is where "identity change, face distortion, different person"
+#               goes.
+#
+# `--distilled-lora` is REQUIRED by the hq parser (args.py), so hq without a
+# LoRA is not a configuration that exists.
+PIPELINES = ("distilled", "hq")
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "5400"))
 
 
@@ -72,6 +87,20 @@ class JobRequest(BaseModel):
     num_frames: int = 121
     frame_rate: int = 24
     seed: int | None = None
+    # "distilled" or "hq" — see PIPELINES.
+    pipeline: str = "distilled"
+    # hq only. Ignored by the distilled pipeline, which has no CFG to steer.
+    negative_prompt: str | None = None
+    num_inference_steps: int | None = Field(default=None, ge=1, le=50)
+    lora_strength: float | None = Field(default=None, ge=0.0, le=2.0)
+    lora_strength_stage_1: float | None = Field(default=None, ge=0.0, le=2.0)
+    lora_strength_stage_2: float | None = Field(default=None, ge=0.0, le=2.0)
+    # Keyframes larger than the video are downscaled here, which is the point of
+    # decoupling the two: the board can hold 832x1216 images so face edits work
+    # on the full-resolution face, while the clip renders at whatever size the
+    # GPU and the shot actually want. Upscaling is refused instead, because
+    # inventing pixels to feed a conditioning frame is never what was meant.
+    allow_upscale: bool = False
     # Off-grid indices are a hard error by default. The whole point of this
     # service is that the caller cannot get placement subtly wrong and then spend
     # a day wondering why the keyframes "don't work"; set this to snap instead.
@@ -97,6 +126,7 @@ class Job:
             "status": self.status,
             "video": f"{base}/job/{self.id}/video" if self.status == "Done" else None,
             "placement": self.placement,
+            "pipeline": self.req.pipeline,
             "queued_s": round((self.started or time.time()) - self.created, 1),
         }
         if self.started:
@@ -121,6 +151,43 @@ def decode_image(src: str, dest: Path):
         dest.write_bytes(requests.get(src, timeout=120).content)
     else:
         raise HTTPException(400, "keyframe image must be a data URI or http(s) URL")
+
+
+def normalise(path: Path, width: int, height: int, allow_upscale: bool) -> str | None:
+    """Bring a keyframe to the exact generation resolution. Returns what it did.
+
+    Conditioning frames must arrive at the generation resolution, and LTX does
+    not refuse a mismatch -- decode.py runs `resize_and_center_crop` on every
+    conditioning image. So the resize happens regardless; the only question is
+    whether it is done deliberately with a good filter or incidentally with
+    whatever torch interpolation LTX reaches for, and whether anyone is told.
+    Doing it here makes it LANCZOS, logged, and reported back on the job.
+
+    Upscaling is refused rather than performed: a keyframe smaller than the clip
+    means detail is being invented to fill a frame the model will then treat as
+    ground truth.
+    """
+    with Image.open(path) as im:
+        sw, sh = im.size
+        if (sw, sh) == (width, height):
+            return None
+        scale = max(width / sw, height / sh)
+        if scale > 1.0 and not allow_upscale:
+            raise RuntimeError(
+                f"{path.name} is {sw}x{sh}, smaller than the {width}x{height} clip. "
+                f"Upscaling it would invent detail the model then treats as ground "
+                f"truth -- render at or below the keyframe size, or pass "
+                f"allow_upscale=true if you really mean it.")
+        # Centre-crop to the target aspect first, then one resample. Cropping
+        # after would resample content that is about to be thrown away.
+        cw, ch = min(sw, round(width / scale)), min(sh, round(height / scale))
+        left, top = (sw - cw) // 2, (sh - ch) // 2
+        out = im.convert("RGB").crop((left, top, left + cw, top + ch)) \
+                .resize((width, height), Image.LANCZOS)
+    out.save(path)
+    kept = (cw * ch) / (sw * sh)
+    return (f"{sw}x{sh} -> {width}x{height} ({width / cw:.2f}x, "
+            f"kept {kept:.0%} of frame)")
 
 
 def plan(req: JobRequest) -> list[dict]:
@@ -171,18 +238,50 @@ def free_the_gpu() -> float:
         raise RuntimeError(f"keyframe-server unreachable at {KEYFRAME_URL}: {e}")
 
 
+DISTILLED_T = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+DEV_T = "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
+DISTILLED_LORA = "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
+
+
 def build_argv(job: Job, workdir: Path) -> list[str]:
+    """Assemble the CLI. Both pipelines take the same core flags.
+
+    The hq path is `-m ltx_pipelines.ti2vid_two_stages_hq` against the dev
+    transformer with the distilled LoRA, recovered from shell history rather
+    than from test1.sh -- that script names --checkpoint-path and --gemma-root,
+    neither of which exists in args.py, which is why its output directory is
+    empty while identity_sweep/ has videos in it.
+    """
     py = LTX_HOME / "venv" / "bin" / "python"
-    argv = [
-        str(py if py.exists() else "python"),
-        "packages/ltx-pipelines/src/ltx_pipelines/distilled.py",
-        "--transformer-path", str(MODELS / "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"),
+    py = str(py if py.exists() else "python")
+    hq = job.req.pipeline == "hq"
+
+    argv = [py]
+    argv += (["-m", "ltx_pipelines.ti2vid_two_stages_hq"] if hq
+             else ["packages/ltx-pipelines/src/ltx_pipelines/distilled.py"])
+    argv += [
+        "--transformer-path", str(MODELS / (DEV_T if hq else DISTILLED_T)),
         "--text-encoder-path", str(MODELS / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
         "--video-vae-path", str(MODELS / "vae/ltx-2.5-video-vae-bf16.safetensors"),
         "--audio-vae-path", str(MODELS / "vae/ltx-2.5-audio-vae-bf16.safetensors"),
         "--spatial-upsampler-path", str(MODELS / "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
         "--prompt", job.req.prompt,
     ]
+
+    if hq:
+        # Required by the hq parser -- hq without a LoRA is not a thing.
+        lora = ["--distilled-lora", str(MODELS / DISTILLED_LORA)]
+        if job.req.lora_strength is not None:
+            lora.append(str(job.req.lora_strength))
+        argv += lora
+        if job.req.lora_strength_stage_1 is not None:
+            argv += ["--distilled-lora-strength-stage-1", str(job.req.lora_strength_stage_1)]
+        if job.req.lora_strength_stage_2 is not None:
+            argv += ["--distilled-lora-strength-stage-2", str(job.req.lora_strength_stage_2)]
+        if job.req.negative_prompt:
+            argv += ["--negative-prompt", job.req.negative_prompt]
+        argv += ["--num-inference-steps", str(job.req.num_inference_steps or 8)]
+
     for i, p in enumerate(job.placement):
         argv += ["--image", str(workdir / f"kf{i + 1}.png"), str(p["index"]), str(p["strength"])]
     argv += [
@@ -213,13 +312,9 @@ def run_job(job: Job):
             # subject's head entirely, and nothing in the output says so.
             # storyboard-ui already normalises uploads to the board size, so
             # this only fires when something bypassed it.
-            with Image.open(dest) as im:
-                if (im.width, im.height) != (job.req.width, job.req.height):
-                    raise RuntimeError(
-                        f"keyframe {i + 1} is {im.width}x{im.height} but the clip "
-                        f"is {job.req.width}x{job.req.height}. LTX would resize and "
-                        f"centre-crop it silently; normalise it first so the crop "
-                        f"is your decision, not a side effect.")
+            note = normalise(dest, job.req.width, job.req.height, job.req.allow_upscale)
+            if note:
+                job.placement[i]["resized"] = note
         (workdir / "prompt.txt").write_text(job.req.prompt)
 
         free = free_the_gpu()
@@ -278,6 +373,19 @@ def submit(req: JobRequest):
                 f"{name}={v} must be divisible by 64. The two-stage distilled "
                 f"pipeline (spatial upsampler) requires it; only one-stage "
                 f"pipelines accept 32. Nearest: {(v // 64) * 64} or {(v // 64 + 1) * 64}.")
+    if req.pipeline not in PIPELINES:
+        raise HTTPException(422, f"pipeline must be one of {PIPELINES}, got {req.pipeline!r}")
+    if req.pipeline == "distilled":
+        # Silently ignoring these would be worse: a caller who sent a negative
+        # prompt to steer identity drift would think it was doing something.
+        unusable = [n for n, v in (("negative_prompt", req.negative_prompt),
+                                   ("num_inference_steps", req.num_inference_steps),
+                                   ("lora_strength", req.lora_strength)) if v is not None]
+        if unusable:
+            raise HTTPException(422,
+                f"{', '.join(unusable)} only apply to pipeline='hq'. The distilled "
+                f"transformer has a fixed schedule and no CFG, so there is nothing "
+                f"for them to steer.")
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
