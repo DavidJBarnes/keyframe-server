@@ -40,7 +40,6 @@ from pathlib import Path
 import requests
 import uvicorn
 from PIL import Image
-from safetensors import safe_open
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -179,6 +178,20 @@ def decode_image(src: str, dest: Path):
         raise HTTPException(400, "keyframe image must be a data URI or http(s) URL")
 
 
+def safetensors_header(path: Path) -> dict:
+    """Tensor names and metadata, without a tensor framework and without the file.
+
+    The format is 8 bytes of little-endian u64 header length, then that many
+    bytes of UTF-8 JSON. So this reads a few hundred KB off a 42 GB checkpoint
+    and needs neither torch nor numpy -- `safe_open(framework="pt")` would drag
+    torch into this venv purely to enumerate strings, and the whole point of the
+    runner having its own venv is that LTX's stays untouched.
+    """
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        return json.loads(f.read(n))
+
+
 _TKEYS: set[str] | None = None
 
 
@@ -187,8 +200,8 @@ def _transformer_keys(transformer: Path) -> set[str]:
     global _TKEYS
     if _TKEYS is None:
         pre = "model.diffusion_model."
-        with safe_open(str(transformer), framework="pt") as f:
-            _TKEYS = {k[len(pre):] if k.startswith(pre) else k for k in f.keys()}
+        _TKEYS = {k[len(pre):] if k.startswith(pre) else k
+                  for k in safetensors_header(transformer) if k != "__metadata__"}
     return _TKEYS
 
 
@@ -208,9 +221,9 @@ def lora_coverage(lora: Path, transformer: Path) -> tuple[int, int]:
     they meet at `transformer_blocks.*`. Comparing the raw file keys reports 0%
     for every LoRA, which looks like a catastrophe and is just the wrong test.
     """
-    with safe_open(str(lora), framework="pt") as f:
-        keys = [k[len("diffusion_model."):] if k.startswith("diffusion_model.") else k
-                for k in f.keys()]
+    pre = "diffusion_model."
+    keys = [k[len(pre):] if k.startswith(pre) else k
+            for k in safetensors_header(lora) if k != "__metadata__"]
     suffix = ".lora_A.weight"
     affected = {k[: -len(suffix)] + ".weight" for k in keys if k.endswith(suffix)}
     return len(affected & _transformer_keys(transformer)), len(affected)
@@ -222,8 +235,7 @@ def lora_base_model(lora: Path) -> str | None:
     Trainers record this inconsistently -- `ss_sd_model_name`, `ss_base_model_version`,
     or nothing at all -- so absence proves nothing and this is advisory only.
     """
-    with safe_open(str(lora), framework="pt") as f:
-        meta = f.metadata() or {}
+    meta = safetensors_header(lora).get("__metadata__") or {}
     return meta.get("ss_sd_model_name") or meta.get("ss_base_model_version")
 
 

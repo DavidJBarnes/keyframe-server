@@ -3,4 +3,3 @@ uvicorn
 requests
 pydantic
 pillow
-safetensors
