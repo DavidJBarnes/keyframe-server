@@ -152,6 +152,16 @@ of the source's skin texture. What claws it back by default is blending source p
 back wherever the warp moved nothing: 19% -> 54% on a mouth edit, 33% -> 62% on
 an eye edit. Tune with `detail_restore` (0-1).
 
+That blend is position-aligned, so it is only valid where the warp left the pixel
+alone — and `|edited - source|` cannot tell you that, because skin sliding over
+skin is a large displacement with a small difference. Blending there superimposes
+a feature on itself: **doubled brows and lids on every `rotate_*` axis**, which is
+the "smudged" look, and it was on at full strength by default. Alpha is now
+max-pooled over a radius set by the *requested* rotation (exact, and unlike a
+pixel-derived estimate not contrast-dependent), so anything near real motion is
+taken wholly from the warp. Expression-only edits are unaffected — they get the
+3px floor. `DETAIL_DILATE` (default 0.08, fraction of face width) is the knob.
+
 `detail_sharpen` (0-3) is **off by default**. It measurably raises texture, but on
 real footage the result reads as crunchy and processed rather than sharp — worse
 than the softness it was meant to fix. It stays available for the one case with no
