@@ -39,6 +39,7 @@ from pathlib import Path
 
 import requests
 import uvicorn
+from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -201,7 +202,24 @@ def run_job(job: Job):
     job.started = time.time()
     try:
         for i, kf in enumerate(job.req.keyframes):
-            decode_image(kf.image, workdir / f"kf{i + 1}.png")
+            dest = workdir / f"kf{i + 1}.png"
+            decode_image(kf.image, dest)
+            # Conditioning frames must arrive at the exact generation
+            # resolution. LTX does not refuse a mismatch -- decode.py runs
+            # `resize_and_center_crop(image, height, width)` on every
+            # conditioning image -- so a wrong-sized keyframe is silently
+            # rescaled and, if the aspect differs, silently re-framed. A
+            # landscape still cropped into a portrait target can lose the
+            # subject's head entirely, and nothing in the output says so.
+            # storyboard-ui already normalises uploads to the board size, so
+            # this only fires when something bypassed it.
+            with Image.open(dest) as im:
+                if (im.width, im.height) != (job.req.width, job.req.height):
+                    raise RuntimeError(
+                        f"keyframe {i + 1} is {im.width}x{im.height} but the clip "
+                        f"is {job.req.width}x{job.req.height}. LTX would resize and "
+                        f"centre-crop it silently; normalise it first so the crop "
+                        f"is your decision, not a side effect.")
         (workdir / "prompt.txt").write_text(job.req.prompt)
 
         free = free_the_gpu()
