@@ -13,3 +13,5 @@ docs/
 *.jpg
 *.jpeg
 *.mp4
+
+ltx-runner/
