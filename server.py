@@ -696,6 +696,33 @@ def _vram() -> tuple[float, float]:
     return dev.get("vram_free", 0) / 1e9, dev.get("vram_total", 0) / 1e9
 
 
+@app.post("/free")
+def free():
+    """Release the checkpoint's VRAM so another process can have the GPU.
+
+    ComfyUI keeps the Qwen checkpoint resident after a request and never gives
+    it back on its own — measured 20.4 GB held, leaving 888 MB free on a 24 GB
+    card. That is not enough for LTX to start, so the two pipelines cannot be
+    co-resident and something has to yield. This is the handshake: the LTX job
+    runner calls it before taking the card, and the next `generate` pays a
+    reload (~30 s) to get the checkpoint back.
+
+    Deliberately explicit rather than automatic on idle. A timer would unload
+    the checkpoint in the middle of a keyframe session, and paying 30 s at a
+    moment nobody chose is worse than paying it at one they did.
+    """
+    before = _vram()[0]
+    r = requests.post(f"{COMFY}/free",
+                      json={"unload_models": True, "free_memory": True}, timeout=120)
+    if r.status_code != 200:
+        raise HTTPException(502, f"ComfyUI refused /free: {r.status_code} {r.text[:200]}")
+    time.sleep(2.0)          # the unload is async; give it a beat before measuring
+    after, total = _vram()
+    print(f"[free] vram {before:.1f} -> {after:.1f} GB free of {total:.1f}", flush=True)
+    return {"freed_gb": round(after - before, 2),
+            "vram_free_gb": round(after, 2), "vram_total_gb": round(total, 2)}
+
+
 @app.get("/health")
 def health():
     try:
