@@ -68,7 +68,17 @@ MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "18.0"))
 # `--distilled-lora` is REQUIRED by the hq parser (args.py), so hq without a
 # LoRA is not a configuration that exists.
 PIPELINES = ("distilled", "hq")
+# Content LoRAs live here, NOT under models/ltx-2.5/loras (that holds the
+# distilled LoRA the hq pipeline needs). Requests name a file in this directory
+# rather than passing a path, so a browser cannot walk the filesystem.
+LORA_DIR = LTX_HOME / "models" / "loras"
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "5400"))
+
+
+class Lora(BaseModel):
+    """A content LoRA by filename, resolved inside LORA_DIR."""
+    name: str
+    strength: float = Field(default=0.6, ge=0.0, le=2.0)
 
 
 class Keyframe(BaseModel):
@@ -80,7 +90,12 @@ class Keyframe(BaseModel):
 
 
 class JobRequest(BaseModel):
-    prompt: str = Field(min_length=1)
+    # Empty is allowed and meaningful: with a strong conditioning image and a
+    # LoRA carrying the motion, an empty prompt is a real configuration rather
+    # than an oversight.
+    prompt: str = ""
+    # Content LoRAs, applied in order. `--lora` is repeatable on both pipelines.
+    loras: list[Lora] = Field(default_factory=list, max_length=4)
     keyframes: list[Keyframe] = Field(min_length=1, max_length=12)
     width: int = 512
     height: int = 768
@@ -101,9 +116,17 @@ class JobRequest(BaseModel):
     # GPU and the shot actually want. Upscaling is refused instead, because
     # inventing pixels to feed a conditioning frame is never what was meant.
     allow_upscale: bool = False
-    # Off-grid indices are a hard error by default. The whole point of this
-    # service is that the caller cannot get placement subtly wrong and then spend
-    # a day wondering why the keyframes "don't work"; set this to snap instead.
+    # Off-grid indices are REPORTED, not refused.
+    #
+    # The recipe says an off-grid index "gets snapped elsewhere". No snapping
+    # code exists: VideoConditionByKeyframeIndex.apply_to does
+    # `positions += frame_idx` and divides by fps, so the index is an exact
+    # continuous time. The reasonable worry is that a keyframe token which does
+    # not coincide with a latent slot spreads its influence over the neighbours
+    # instead of pinning one -- but that is inference, not measurement, and
+    # working commands here use index 8. So off-grid comes back flagged on the
+    # job and `strict_grid` opts into refusing it.
+    strict_grid: bool = False
     snap_indices: bool = False
 
 
@@ -153,6 +176,22 @@ def decode_image(src: str, dest: Path):
         raise HTTPException(400, "keyframe image must be a data URI or http(s) URL")
 
 
+def resolve_lora(name: str) -> Path:
+    """A filename inside LORA_DIR, never a path.
+
+    Requests come from a browser, so anything path-shaped is refused outright
+    rather than sanitised -- there is no legitimate reason for a LoRA reference
+    to contain a separator.
+    """
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(422, f"lora must be a filename in {LORA_DIR}, not a path")
+    p = (LORA_DIR / name)
+    if not p.is_file():
+        avail = sorted(f.name for f in LORA_DIR.glob("*.safetensors"))
+        raise HTTPException(422, f"no such lora {name!r}. Available: {avail}")
+    return p
+
+
 def normalise(path: Path, width: int, height: int, allow_upscale: bool) -> str | None:
     """Bring a keyframe to the exact generation resolution. Returns what it did.
 
@@ -198,24 +237,23 @@ def plan(req: JobRequest) -> list[dict]:
     out = []
     for i, kf in enumerate(req.keyframes):
         idx = auto_idx[i] if kf.index is None else kf.index
-        snapped = False
+        snapped, off_grid = False, False
         if not ltx_grid.is_on_grid(idx):
-            if not req.snap_indices:
+            if req.strict_grid:
                 raise HTTPException(422,
-                    f"keyframe {i}: index {idx} is off the LTX latent grid. The video "
-                    f"encoder is causal with temporal scale 8, so the only valid indices "
-                    f"are 0 or 1+8k -- nearest legal values are "
-                    f"{ltx_grid.snap(idx - 4)} and {ltx_grid.snap(idx + 4)}. An off-grid "
-                    f"index is not snapped for you: the guide token lands between two "
-                    f"latent slots and smears across both. Pass snap_indices=true to "
-                    f"snap automatically.")
-            idx, snapped = ltx_grid.snap(idx), True
+                    f"keyframe {i}: index {idx} is off the latent grid (0 or 1+8k); "
+                    f"nearest are {ltx_grid.snap(idx - 4)} and {ltx_grid.snap(idx + 4)}.")
+            if req.snap_indices:
+                idx, snapped = ltx_grid.snap(idx), True
+            else:
+                off_grid = True
         if idx > req.num_frames:
             raise HTTPException(422,
                 f"keyframe {i}: index {idx} is past num_frames={req.num_frames}")
         out.append({"index": idx,
                     "strength": auto_str[i] if kf.strength is None else kf.strength,
-                    "snapped_from": kf.index if snapped else None})
+                    "snapped_from": kf.index if snapped else None,
+                    "off_grid": off_grid})
     idxs = [o["index"] for o in out]
     if len(set(idxs)) != len(idxs):
         raise HTTPException(422, f"two keyframes share a latent slot: {idxs}. The later "
@@ -281,6 +319,9 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
         if job.req.negative_prompt:
             argv += ["--negative-prompt", job.req.negative_prompt]
         argv += ["--num-inference-steps", str(job.req.num_inference_steps or 8)]
+
+    for lo in job.req.loras:
+        argv += ["--lora", str(resolve_lora(lo.name)), str(lo.strength)]
 
     for i, p in enumerate(job.placement):
         argv += ["--image", str(workdir / f"kf{i + 1}.png"), str(p["index"]), str(p["strength"])]
@@ -386,6 +427,8 @@ def submit(req: JobRequest):
                 f"{', '.join(unusable)} only apply to pipeline='hq'. The distilled "
                 f"transformer has a fixed schedule and no CFG, so there is nothing "
                 f"for them to steer.")
+    for lo in req.loras:
+        resolve_lora(lo.name)      # fail at submit, not four minutes in
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
@@ -418,6 +461,18 @@ def video(job_id: str):
 def list_jobs():
     return {"jobs": [j.view(PUBLIC_BASE) for j in
                      sorted(JOBS.values(), key=lambda j: -j.created)][:50]}
+
+
+@app.get("/loras")
+def loras():
+    """Content LoRAs available to `loras: [{name, strength}]`."""
+    if not LORA_DIR.is_dir():
+        return {"dir": str(LORA_DIR), "loras": []}
+    return {"dir": str(LORA_DIR),
+            "loras": sorted(
+                ({"name": f.name, "size_gb": round(f.stat().st_size / 1e9, 2)}
+                 for f in LORA_DIR.glob("*.safetensors")),
+                key=lambda x: x["name"])}
 
 
 @app.get("/health")
