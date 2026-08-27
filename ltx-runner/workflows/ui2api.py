@@ -31,6 +31,26 @@ REMAP = {
     "gemma_3_12B_it_fp8_scaled.safetensors": "gemma_3_12B_it_fp8_scaled.safetensors",
 }
 
+PRIMITIVE = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3"}
+
+
+def is_widget_type(typ) -> bool:
+    """Whether an input occupies a widgets_values slot.
+
+    Union types are written as a comma-joined string -- LTXVEmptyLatentAudio's
+    frame_rate is "FLOAT,INT" -- and an exact-membership test misses them. Such
+    an input still holds a widget slot even while accepting a link, so treating
+    it as link-only shifts every later widget by one: that is how batch_size came
+    to hold 24, the frame rate, and produced a 24-batch audio latent against a
+    1-batch video one ("Expected size 1 but got size 24").
+    """
+    if isinstance(typ, list):
+        return True
+    if not isinstance(typ, str):
+        return False
+    return any(part.strip() in PRIMITIVE for part in typ.split(","))
+
+
 VIRTUAL = {"Reroute", "PrimitiveNode", "SetNode", "GetNode",
            "Note", "MarkdownNote", "Fast Groups Bypasser (rgthree)",
            "PreviewAny", "VisualizeSigmasKJ", "easy showAnything"}
@@ -157,9 +177,7 @@ def convert(path, registered=None, remap=None):
                 # A list of options, a primitive, or a dynamic combo is a widget.
                 # Anything else (MODEL, CLIP, LATENT, IMAGE, COMFY_MATCHTYPE_V3
                 # ...) arrives over a link and consumes no widgets_values slot.
-                if isinstance(typ, list) or typ in (
-                        "INT", "FLOAT", "STRING", "BOOLEAN", "COMBO",
-                        "COMFY_DYNAMICCOMBO_V3"):
+                if isinstance(typ, list) or is_widget_type(typ):
                     widget_names.append(name)
         wi = 0
         for name in widget_names:
