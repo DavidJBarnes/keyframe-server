@@ -74,3 +74,32 @@ error, and each found only by submitting and reading ComfyUI's validator:
 - The sampler-preview VAE (`taeltx2_3`) is not present; `pixel_space` is the
   built-in fallback and affects only previews, not output.
 - `SimpleCalculatorKJ`'s autogrow `variables` group is not fully modelled.
+
+
+## The working configuration
+
+`ltx23_working.api.json` is the graph that produced the first good render:
+portrait 704x1280, 241 frames, 10s, ~256s on the 3090, peak 22.6 GB of 24.5.
+`patch_graph.py` regenerates it from the converted workflow.
+
+Three corrections to the author's defaults were needed, and none are conversion
+bugs — the workflow simply ships configured for someone else:
+
+1. **The prompt must go to the POSITIVE encoder.** `LTXVConditioning` wires
+   `positive <- 121`, `negative <- 110`. Guessing by "longest string wins" put
+   the whole prompt in the NEGATIVE, so the model was told to avoid exactly what
+   was asked for, while the positive slot kept the author's placeholder
+   ("Make this image come alive with fluid motion."). The result was a slow
+   camera drift over a still subject — and it scored *better* on a temporal
+   smoothness metric than the correct render, because a near-static clip is
+   maximally smooth. Read the `LTXVConditioning` wiring; never guess.
+2. **The workflow is authored landscape** (WIDTH 1280, HEIGHT 736). A portrait
+   source needs those constants swapped.
+3. **The content LoRA is not in the file.** rgthree's Power Lora Loader ships
+   empty and carries its LoRAs in dynamic widgets the API schema does not
+   declare, so it cannot be filled over `/prompt`. Splice an explicit
+   `LoraLoaderModelOnly` in after it instead.
+
+Trigger tokens lead the prompt (`m15510n4ry. ...`); the LoRA records none in its
+metadata, so they come from the Civitai model page:
+`m15510n4ry`, `bl0wj0b`, `d0ubl3_bj`, `d0gg1e`, `c0wg1rl`, `r3v3rs3_c0wg1rl`.
