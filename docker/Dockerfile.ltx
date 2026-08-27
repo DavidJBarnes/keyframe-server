@@ -28,8 +28,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
-# torch first and alone so a resolver backtrack cannot quietly pick another build.
-RUN pip install --no-cache-dir "torch==2.12.1" "torchvision==0.27.1" "torchaudio==2.12.1"
+# torch first and alone so a resolver backtrack cannot quietly pick another
+# build. Same pair as the keyframe-server image, which is proven on this GPU.
+#
+# No torchaudio: there is no 2.12.x release (published stops at 2.11.0), and
+# pinning it would either fail the build or drag torch backwards to match. If a
+# node turns out to need it, add it explicitly against whatever torch resolves
+# to rather than letting the resolver choose for both.
+RUN pip install --no-cache-dir "torch==2.12.1" "torchvision==0.27.1"
 
 ARG COMFYUI_COMMIT=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
