@@ -77,7 +77,18 @@ MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "18.0"))
 # projection — so the CLI differs from 2.5's five split paths: it takes
 # --checkpoint-path (or --distilled-checkpoint-path for distilled.py) plus
 # --gemma-root pointing at a Gemma HF directory.
-PIPELINES = ("distilled", "hq", "ltx23", "ltx23-hq")
+#   ltx23-pure — the 2.3 DEV monolith through ti2vid_one_stage, with NO
+#               distillation anywhere. Both two-stage parsers make
+#               --distilled-lora required=True, so "dev + HQ" still applies a
+#               distilled schedule at stage 2; ti2vid_one_stage is the only path
+#               that applies none. Use it when the model author says the weights
+#               perform best undistilled.
+#
+#               The cost is real: one stage means no 2x latent upscale, so every
+#               step denoises at the full target resolution rather than a quarter
+#               of it, and the undistilled default is 30 steps against 8. Expect
+#               it to be several times slower and much heavier on VRAM.
+PIPELINES = ("distilled", "hq", "ltx23", "ltx23-hq", "ltx23-pure")
 MODELS_23 = LTX_HOME / "models" / "ltx-2.3"
 # Content LoRAs live here, NOT under models/ltx-2.5/loras (that holds the
 # distilled LoRA the hq pipeline needs). Requests name a file in this directory
@@ -383,11 +394,21 @@ def is_23(pipeline: str) -> bool:
     return pipeline.startswith("ltx23")
 
 
+def is_hq(pipeline: str) -> bool:
+    """Two-stage paths that require LTX's own distilled LoRA at stage 2."""
+    return pipeline in ("hq", "ltx23-hq")
+
+
+def is_pure(pipeline: str) -> bool:
+    """Single-stage, no distilled LoRA, full CFG at full resolution."""
+    return pipeline == "ltx23-pure"
+
+
 def base_transformer(pipeline: str) -> Path:
     """The weights a LoRA would be fused into, for coverage checking."""
     if pipeline == "ltx23":
         return T23_DISTILLED
-    if pipeline == "ltx23-hq":
+    if pipeline in ("ltx23-hq", "ltx23-pure"):
         return T23_DEV
     return MODELS / (DEV_T if pipeline == "hq" else DISTILLED_T)
 
@@ -395,8 +416,11 @@ def base_transformer(pipeline: str) -> Path:
 def require_23_assets(pipeline: str) -> None:
     """Fail at submit with something actionable, not four minutes into a run."""
     need = [(GEMMA_23, "Gemma text encoder directory"),
-            (UPSAMPLER_23, "2.3 spatial upsampler"),
-            (T23_DEV if pipeline == "ltx23-hq" else T23_DISTILLED, "2.3 checkpoint")]
+            (T23_DEV if pipeline in ("ltx23-hq", "ltx23-pure") else T23_DISTILLED,
+             "2.3 checkpoint")]
+    if not is_pure(pipeline):
+        # One stage means no latent upscale, so no upsampler is loaded at all.
+        need.append((UPSAMPLER_23, "2.3 spatial upsampler"))
     if pipeline == "ltx23-hq":
         need.append((LORA_23, "2.3 distilled LoRA (required by the hq parser)"))
     missing = [f"{d} at {p}" for p, d in need if not p.exists()]
@@ -418,22 +442,30 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
     py = LTX_HOME / "venv" / "bin" / "python"
     py = str(py if py.exists() else "python")
     pipe = job.req.pipeline
-    hq = pipe in ("hq", "ltx23-hq")
-    v23 = is_23(pipe)
+    hq, pure, v23 = is_hq(pipe), is_pure(pipe), is_23(pipe)
 
     argv = [py]
-    argv += (["-m", "ltx_pipelines.ti2vid_two_stages_hq"] if hq
-             else ["packages/ltx-pipelines/src/ltx_pipelines/distilled.py"])
+    if pure:
+        argv += ["-m", "ltx_pipelines.ti2vid_one_stage"]
+    elif hq:
+        argv += ["-m", "ltx_pipelines.ti2vid_two_stages_hq"]
+    else:
+        argv += ["packages/ltx-pipelines/src/ltx_pipelines/distilled.py"]
 
     if v23:
         # Monolith: the checkpoint carries the transformer, both VAEs and the
         # text projection, so there is nothing to pass for vae or text-encoder.
         # distilled.py's parser names the monolith --distilled-checkpoint-path;
         # the hq parser names it --checkpoint-path. Same file role, two flags.
-        argv += [("--checkpoint-path" if hq else "--distilled-checkpoint-path"),
-                 str(T23_DEV if hq else T23_DISTILLED),
-                 "--gemma-root", str(GEMMA_23),
-                 "--spatial-upsampler-path", str(UPSAMPLER_23)]
+        # --distilled-checkpoint-path exists only on distilled.py's parser;
+        # everything else names the monolith --checkpoint-path.
+        monolith = hq or pure
+        argv += [("--checkpoint-path" if monolith else "--distilled-checkpoint-path"),
+                 str(T23_DEV if monolith else T23_DISTILLED),
+                 "--gemma-root", str(GEMMA_23)]
+        # One stage never upscales, so it neither needs nor accepts an upsampler.
+        if not pure:
+            argv += ["--spatial-upsampler-path", str(UPSAMPLER_23)]
     else:
         argv += [
             "--transformer-path", str(MODELS / (DEV_T if hq else DISTILLED_T)),
@@ -459,6 +491,14 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
         if job.req.negative_prompt:
             argv += ["--negative-prompt", job.req.negative_prompt]
         argv += ["--num-inference-steps", str(job.req.num_inference_steps or 8)]
+
+    if pure:
+        if job.req.negative_prompt:
+            argv += ["--negative-prompt", job.req.negative_prompt]
+        # 30 is LTX_2_3_PARAMS' own default for the undistilled schedule. The 8
+        # used by the HQ path is a distilled-schedule number and would badly
+        # under-denoise here.
+        argv += ["--num-inference-steps", str(job.req.num_inference_steps or 30)]
 
     for lo in job.req.loras:
         argv += ["--lora", str(resolve_lora(lo.name)), str(lo.strength)]
