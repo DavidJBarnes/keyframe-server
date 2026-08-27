@@ -1,5 +1,16 @@
 # LTX-2.5 Multi-Keyframe Conditioning Recipe
 
+> **Superseded for execution.** The command shapes here drive LTX's own CLI,
+> which exposes no sampler, scheduler, shift or sigma control and therefore
+> cannot reproduce community workflows or use content LoRAs well. For anything
+> involving LoRAs or matching published output, see
+> [ltx-2.3-comfyui-recipe.md](ltx-2.3-comfyui-recipe.md).
+>
+> The **conditioning** rules below still hold — they are model behaviour, not
+> interface. One correction: §2 says dimensions divisible by 32; that is the
+> one-stage rule. Two-stage pipelines require **64**
+> (`assert_resolution(..., is_two_stage=True)`).
+
 The core mental model: multi-frame injection is a **constraint, not an identity source**. LTX does not learn the character from frame 0 and propagate it — it treats every conditioned image as a literal waypoint the video must pass through and interpolates motion between them. Identity consistency is your job, upstream; LTX's job is choreography between beats you have already made consistent.
 
 ## 1. Keyframe production

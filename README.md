@@ -14,6 +14,11 @@ Two pipelines behind one endpoint, because no single model does both jobs:
 
 That split is measured, not stylistic — see [docs/dual-pipeline-design.md](docs/dual-pipeline-design.md).
 
+Video generation from those keyframes is a third pipeline, LTX-2.3 through
+ComfyUI: [docs/ltx-2.3-comfyui-recipe.md](docs/ltx-2.3-comfyui-recipe.md) is the
+working recipe — container, models, LoRAs, the workflow catalogue, and the three
+corrections every downloaded workflow needs.
+
 - `server.py` — the endpoint (`POST /generate`, `GET /health`)
 - `client/client.py` — CLI keyframe factory ([client README](client/README.md))
 - `docker/` — the runtime: ComfyUI + both pipelines ([docker README](docker/README.md))
