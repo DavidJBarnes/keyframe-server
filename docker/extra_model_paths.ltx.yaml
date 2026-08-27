@@ -20,7 +20,11 @@ ltx23:
         loras
         ../loras
 
-    # LTXVLatentUpsampler / LatentUpscaleModelLoader
+    # LatentUpscaleModelLoader reads the folder key "latent_upscale_models"
+    # (comfy_extras/nodes_hunyuan.py), which is distinct from the "upscale_models"
+    # key used by ordinary ESRGAN-style upscalers. Mapping the wrong one leaves
+    # its dropdown empty with no error until a graph is submitted.
+    latent_upscale_models: latent_upscale_models
     upscale_models: latent_upscale_models
 
     # Gemma. NOTE: the HF repo layout downloaded for the CLI's --gemma-root is
