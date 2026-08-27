@@ -142,8 +142,15 @@ class JobRequest(BaseModel):
     lora_strength_stage_2: float | None = Field(default=None, ge=0.0, le=2.0)
     # CFG guidance. "Adjust steps and CFG accordingly for both passes" is the
     # other half of that advice, and neither was reachable before.
+    # CFG is not the interesting one -- the CLI already defaults to 3.0, which
+    # matches the reference workflows. STG is: the LTX_2_3_HQ preset ships with
+    # stg=0.0 and no stg_blocks ("STG off" per its own comment) while RuneXX's
+    # LTX-2.3 Dev Full-Steps workflow runs stg=3 with rescale=0.9 on block 28.
+    # So the stock hq path has spatiotemporal guidance disabled entirely.
     cfg_scale: float | None = Field(default=None, ge=0.0, le=20.0)
     stg_scale: float | None = Field(default=None, ge=0.0, le=20.0)
+    rescale_scale: float | None = Field(default=None, ge=0.0, le=1.0)
+    stg_blocks: str | None = None
     # Keyframes larger than the video are downscaled here, which is the point of
     # decoupling the two: the board can hold 832x1216 images so face edits work
     # on the full-resolution face, while the clip renders at whatever size the
@@ -188,7 +195,8 @@ class Job:
             "loras": self.loras,
             "distill": ({"stage_1": self.req.lora_strength_stage_1,
                          "stage_2": self.req.lora_strength_stage_2,
-                         "cfg": self.req.cfg_scale, "stg": self.req.stg_scale}
+                         "cfg": self.req.cfg_scale, "stg": self.req.stg_scale,
+                         "rescale": self.req.rescale_scale, "stg_blocks": self.req.stg_blocks}
                         if is_hq(self.req.pipeline) else None),
             "queued_s": round((self.started or time.time()) - self.created, 1),
         }
@@ -513,6 +521,12 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
             argv += ["--video-cfg-guidance-scale", str(job.req.cfg_scale)]
         if job.req.stg_scale is not None:
             argv += ["--video-stg-guidance-scale", str(job.req.stg_scale)]
+        if job.req.rescale_scale is not None:
+            argv += ["--video-rescale-scale", str(job.req.rescale_scale)]
+        # STG needs a block to act on; the HQ preset clears the list, so raising
+        # stg_scale alone leaves it with nothing to do.
+        if job.req.stg_blocks:
+            argv += ["--video-stg-blocks", job.req.stg_blocks]
 
     if pure:
         if job.req.negative_prompt:
@@ -636,6 +650,8 @@ def submit(req: JobRequest):
                                    ("lora_strength", req.lora_strength),
                                    ("cfg_scale", req.cfg_scale),
                                    ("stg_scale", req.stg_scale),
+                                   ("rescale_scale", req.rescale_scale),
+                                   ("stg_blocks", req.stg_blocks),
                                    ("lora_strength_stage_1", req.lora_strength_stage_1),
                                    ("lora_strength_stage_2", req.lora_strength_stage_2))
                     if v is not None]
