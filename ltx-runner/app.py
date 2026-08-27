@@ -130,8 +130,20 @@ class JobRequest(BaseModel):
     negative_prompt: str | None = None
     num_inference_steps: int | None = Field(default=None, ge=1, le=50)
     lora_strength: float | None = Field(default=None, ge=0.0, le=2.0)
+    # Per-stage distilled-LoRA strength on the hq paths.
+    #
+    # These matter more than the names suggest. LTX defaults stage 1 to 0.25 and
+    # stage 2 to 0.50, and the DR34ML4Y author states plainly that the
+    # distillation LoRA and checkpoint "actively fight the nsfw training and
+    # account for body horror", recommending the full dev checkpoint at 0.25-0.35
+    # distill strength. The stage-2 default of 0.5 sits ABOVE that range, so the
+    # out-of-the-box hq configuration is already past what the LoRA tolerates.
     lora_strength_stage_1: float | None = Field(default=None, ge=0.0, le=2.0)
     lora_strength_stage_2: float | None = Field(default=None, ge=0.0, le=2.0)
+    # CFG guidance. "Adjust steps and CFG accordingly for both passes" is the
+    # other half of that advice, and neither was reachable before.
+    cfg_scale: float | None = Field(default=None, ge=0.0, le=20.0)
+    stg_scale: float | None = Field(default=None, ge=0.0, le=20.0)
     # Keyframes larger than the video are downscaled here, which is the point of
     # decoupling the two: the board can hold 832x1216 images so face edits work
     # on the full-resolution face, while the clip renders at whatever size the
@@ -174,6 +186,10 @@ class Job:
             "placement": self.placement,
             "pipeline": self.req.pipeline,
             "loras": self.loras,
+            "distill": ({"stage_1": self.req.lora_strength_stage_1,
+                         "stage_2": self.req.lora_strength_stage_2,
+                         "cfg": self.req.cfg_scale, "stg": self.req.stg_scale}
+                        if is_hq(self.req.pipeline) else None),
             "queued_s": round((self.started or time.time()) - self.created, 1),
         }
         if self.started:
@@ -492,6 +508,12 @@ def build_argv(job: Job, workdir: Path) -> list[str]:
             argv += ["--negative-prompt", job.req.negative_prompt]
         argv += ["--num-inference-steps", str(job.req.num_inference_steps or 8)]
 
+    if hq or pure:
+        if job.req.cfg_scale is not None:
+            argv += ["--video-cfg-guidance-scale", str(job.req.cfg_scale)]
+        if job.req.stg_scale is not None:
+            argv += ["--video-stg-guidance-scale", str(job.req.stg_scale)]
+
     if pure:
         if job.req.negative_prompt:
             argv += ["--negative-prompt", job.req.negative_prompt]
@@ -611,7 +633,12 @@ def submit(req: JobRequest):
         # prompt to steer identity drift would think it was doing something.
         unusable = [n for n, v in (("negative_prompt", req.negative_prompt),
                                    ("num_inference_steps", req.num_inference_steps),
-                                   ("lora_strength", req.lora_strength)) if v is not None]
+                                   ("lora_strength", req.lora_strength),
+                                   ("cfg_scale", req.cfg_scale),
+                                   ("stg_scale", req.stg_scale),
+                                   ("lora_strength_stage_1", req.lora_strength_stage_1),
+                                   ("lora_strength_stage_2", req.lora_strength_stage_2))
+                    if v is not None]
         if unusable:
             raise HTTPException(422,
                 f"{', '.join(unusable)} only apply to pipeline='hq'. The distilled "
