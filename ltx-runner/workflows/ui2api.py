@@ -133,24 +133,58 @@ def convert(path, registered=None, remap=None):
         # `widgets_values` and rely on the order the node's schema declares. Fall
         # back to the server's own schema for the second case, which is also the
         # only source of truth for which inputs are widgets rather than links.
-        wv = list(n.get("widgets_values") or [])
-        widget_names = [i.get("name") for i in (n.get("inputs") or [])
-                        if i.get("widget") is not None]
-        if not widget_names and registered is not None:
-            spec = (registered.get(t) or {}).get("input", {}).get("required", {})
+        raw_wv = n.get("widgets_values")
+        # Some nodes (VideoHelperSuite's VHS_VideoCombine among them) store
+        # widgets_values as a DICT keyed by input name rather than a positional
+        # list. Calling list() on that yields the keys, which is how loop_count
+        # ended up holding the string "loop_count".
+        if isinstance(raw_wv, dict):
+            entry["inputs"].update({k: v for k, v in raw_wv.items()
+                                    if not isinstance(v, (dict, list))})
+            wv = []
+        else:
+            wv = list(raw_wv or [])
+        # Always take the widget ORDER from the server schema, never from the
+        # node's inputs array. That array lists only widgets the author had
+        # converted into inputs -- node 165 shows just width/height while
+        # widgets_values carries all eight -- so trusting it truncates the list
+        # and silently leaves every later widget on its default.
+        widget_names = []
+        spec = ((registered or {}).get(t) or {}).get("input", {}).get("required", {})
+        if spec:
             for name, meta in spec.items():
                 typ = meta[0]
-                # A list of options, or a primitive, is a widget; anything else
-                # (MODEL, CLIP, LATENT, IMAGE ...) arrives over a link.
-                if isinstance(typ, list) or typ in ("INT", "FLOAT", "STRING",
-                                                    "BOOLEAN", "COMBO"):
+                # A list of options, a primitive, or a dynamic combo is a widget.
+                # Anything else (MODEL, CLIP, LATENT, IMAGE, COMFY_MATCHTYPE_V3
+                # ...) arrives over a link and consumes no widgets_values slot.
+                if isinstance(typ, list) or typ in (
+                        "INT", "FLOAT", "STRING", "BOOLEAN", "COMBO",
+                        "COMFY_DYNAMICCOMBO_V3"):
                     widget_names.append(name)
         wi = 0
         for name in widget_names:
             if wi >= len(wv):
                 break
+            meta = spec.get(name) or []
+            typ = meta[0] if meta else None
             entry["inputs"][name] = wv[wi]
             wi += 1
+
+            # A dynamic combo picks a mode, and that mode brings its own inputs
+            # which sit inline in widgets_values right after the key. Skipping
+            # them shifts every later widget by one -- which is how
+            # keep_proportion ended up holding a boolean.
+            if typ == "COMFY_DYNAMICCOMBO_V3":
+                chosen = next((o for o in (meta[1].get("options") or [])
+                               if o.get("key") == entry["inputs"][name]), None)
+                # Dynamic sub-inputs are addressed with a dotted name, the
+                # same convention autogrow groups use (node 311 carries
+                # "variables.a"). A bare "multiplier" is rejected.
+                for sub in ((chosen or {}).get("inputs", {}).get("required", {})):
+                    if wi < len(wv):
+                        entry["inputs"][f"{name}.{sub}"] = wv[wi]
+                        wi += 1
+
             # Seeds carry a hidden "control_after_generate" companion value in
             # the UI that has no counterpart in the API schema.
             if name in ("seed", "noise_seed") and wi < len(wv) and \

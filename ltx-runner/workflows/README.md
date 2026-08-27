@@ -54,10 +54,23 @@ Passing `objinfo.json` is what enables schema-default filling and dropping nodes
 the server does not know (shared workflows carry API/subgraph nodes that are
 usually preview branches).
 
+Three more traps, each of which produced a silently wrong graph rather than an
+error, and each found only by submitting and reading ComfyUI's validator:
+
+- **Widget order comes from the schema, never the node's `inputs` array.** That
+  array lists only widgets the author had converted into inputs — node 165 shows
+  just `width`/`height` while `widgets_values` carries all eight — so trusting it
+  truncates the list and leaves every later widget on its default.
+- **`widgets_values` is sometimes a dict**, keyed by input name (VHS_VideoCombine
+  does this). `list()` on it yields the keys, which is how `loop_count` ended up
+  holding the string `"loop_count"`.
+- **Dynamic combos consume their sub-inputs inline**, addressed with a dotted
+  name (`resize_type.multiplier`), matching the convention autogrow groups use
+  (`variables.a`). Skipping them shifts every later widget by one.
+
 ## Known remaining gaps
 
-- `SimpleCalculatorKJ` and `ResizeImageMaskNode` use ComfyUI's V3 dynamic input
-  types (`COMFY_AUTOGROW_V3`, `COMFY_DYNAMICCOMBO_V3`). Positional mapping cannot
-  model those; their inputs need setting by hand.
 - `LoadImage` points at the author's sample file and must be repointed.
-- The sampler-preview VAE (`taeltx2_3`) is not present; `pixel_space` works.
+- The sampler-preview VAE (`taeltx2_3`) is not present; `pixel_space` is the
+  built-in fallback and affects only previews, not output.
+- `SimpleCalculatorKJ`'s autogrow `variables` group is not fully modelled.
